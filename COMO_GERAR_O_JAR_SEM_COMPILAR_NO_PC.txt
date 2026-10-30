@@ -1,0 +1,32 @@
+MINI STEVE & MINI ALEX — GERAR O JAR SEM COMPILAR NO COMPUTADOR
+Minecraft 1.16.5 | Forge 36.1.0 | pensado para OptiFine HD U G8
+
+ATENCAO: Este ZIP CONTEM O PROJETO, NAO CONTEM O .JAR JOGAVEL.
+O .jar so existira depois que o GitHub Actions completar o build com sucesso.
+Ate agora nao foi possivel testar a compilacao com as bibliotecas reais do Forge.
+
+COMO GERAR O MOD PELA NUVEM:
+1. Crie uma conta gratuita no GitHub (se nao tiver) em https://github.com
+2. Crie um repositorio novo (pode ser PRIVADO).
+3. Extraia este ZIP. Envie todos os arquivos E pastas extraidos para a RAIZ do repositorio,
+   inclusive a pasta oculta ".github". Esta pasta eh NECESSARIA para o fluxo automatico.
+4. Abra a aba "Actions" do seu repositorio no GitHub.
+5. Se o GitHub pedir, habilite workflows para esse repositorio.
+6. Abra "Compilar Mini Steve e Mini Alex 1.16.5" e clique "Run workflow".
+7. Quando terminar com sinal verde, abra o resultado da execucao.
+8. Na secao "Artifacts", baixe "mini-steve-alex-1.16.5-JAR".
+9. Extraia o arquivo baixado. O arquivo
+   mini-companheiros-1.16.5-0.3.0.jar
+   e o UNICO arquivo do pacote que deve ser colocado na pasta mods do Minecraft.
+10. Inicie o perfil Forge 36.1.0 com o Minecraft 1.16.5. Use OptiFine G8 apenas apos
+    verificar que o mod abre sem ele, e teste em um mundo novo.
+
+SE O BUILD MOSTRAR SINAL VERMELHO:
+- O JAR NAO FOI GERADO; clique na etapa com erro para copiar o log.
+- Envie o trecho do erro para o ChatGPT. O codigo ainda pode requerer correcoes.
+
+IMPORTANTE:
+- Nao coloque este ZIP na pasta mods.
+- Nao altere a extensao .zip para .jar.
+- Nao coloque arquivos .java, README ou testes na pasta mods.
+- O teste em jogo e compatibilidade com OptiFine NAO foram executados neste ambiente.

@@ -1,0 +1,23 @@
+modLoader="javafml"
+loaderVersion="[36,)"
+license="MIT"
+[[mods]]
+modId="minicompanheiros"
+version="${file.jarVersion}"
+displayName="Mini Companheiros"
+authors="Projeto independente"
+description='''
+Mini Steve e Mini Alex com IA local: ajudam a minerar, cortar madeira e cacar, com fome, vida, inventario, memoria e tarefas autorizadas pelo jogador.
+'''
+[[dependencies.minicompanheiros]]
+modId="forge"
+mandatory=true
+versionRange="[36.1.0,37)"
+ordering="NONE"
+side="BOTH"
+[[dependencies.minicompanheiros]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.16.5,1.17)"
+ordering="NONE"
+side="BOTH"

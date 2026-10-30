@@ -1,0 +1,51 @@
+buildscript {
+    repositories {
+        maven { url = 'https://maven.minecraftforge.net' }
+        mavenCentral()
+    }
+    dependencies {
+        classpath group: 'net.minecraftforge.gradle', name: 'ForgeGradle', version: '4.1.+', changing: true
+    }
+}
+apply plugin: 'net.minecraftforge.gradle'
+apply plugin: 'java'
+
+version = '0.3.0'
+group = 'br.com.minicompanheiros'
+archivesBaseName = 'mini-companheiros-1.16.5'
+sourceCompatibility = targetCompatibility = JavaVersion.VERSION_1_8
+compileJava.options.encoding = 'UTF-8'
+
+minecraft {
+    mappings channel: 'official', version: '1.16.5'
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'info'
+            mods { minicompanheiros { source sourceSets.main } }
+        }
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.console.level', 'info'
+            mods { minicompanheiros { source sourceSets.main } }
+        }
+    }
+}
+repositories { mavenCentral() }
+// Compila contra o Forge indicado como compatível pelo OptiFine 1.16.5 HD U G8.
+// O OptiFine NÃO é dependência de compilação e não é incluído no .jar.
+dependencies { minecraft 'net.minecraftforge:forge:1.16.5-36.1.0' }
+
+jar {
+    manifest {
+        attributes([
+            'Specification-Title': 'Mini Companheiros',
+            'Specification-Vendor': 'Projeto independente',
+            'Specification-Version': '1',
+            'Implementation-Title': project.name,
+            'Implementation-Version': project.version,
+            'Implementation-Vendor': 'Projeto independente'
+        ])
+    }
+}

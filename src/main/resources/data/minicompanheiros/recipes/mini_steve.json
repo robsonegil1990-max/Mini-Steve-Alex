@@ -1,0 +1,13 @@
+{
+  "type": "minecraft:crafting_shaped",
+  "pattern": ["DED", "ICI", "ONO"],
+  "key": {
+    "D": {"item": "minecraft:diamond"},
+    "E": {"item": "minecraft:emerald"},
+    "I": {"item": "minecraft:iron_block"},
+    "C": {"item": "minecraft:armor_stand"},
+    "O": {"item": "minecraft:obsidian"},
+    "N": {"item": "minecraft:netherite_scrap"}
+  },
+  "result": {"item": "minicompanheiros:mini_steve", "count": 1}
+}
