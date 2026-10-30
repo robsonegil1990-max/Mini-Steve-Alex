@@ -20,7 +20,7 @@ public class RenderCompanheiro extends MobRenderer<CompanheiroEntity, PlayerMode
     public RenderCompanheiro(EntityRendererManager manager) {
         super(manager, new PlayerModel<>(0.0F, false), 0.24F);
         // Camada vanilla: mostra espada, machado e picareta conforme a tarefa.
-        addLayer(new ItemInHandLayer<>(this));
+        addLayer(new HeldItemLayer<>(this));
     }
 
     @Override
