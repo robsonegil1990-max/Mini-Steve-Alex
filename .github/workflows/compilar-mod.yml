@@ -41,10 +41,13 @@ jobs:
           cp -r /tmp/forge-mdk/gradle ./gradle
           chmod +x ./gradlew
 
+
       - name: Compilar JAR Forge (inclui remapeamento)
         run: |
           set -euo pipefail
+          mkdir -p "$HOME/.gradle/caches/forge_gradle/mcp_repo/de/oceanlabs/mcp/mcp_config/1.16.5"
           ./gradlew --no-daemon --stacktrace --console=plain build
+
 
       - name: Confirmar estrutura interna do arquivo compilado
         run: |
