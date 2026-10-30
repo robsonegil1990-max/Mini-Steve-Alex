@@ -17,7 +17,7 @@ assert "version = '0.3.0'" in build
 assert 'versionRange="[36.1.0,37)"' in mods
 assert 'modId="minicompanheiros"' in mods
 assert '1.16.5-0.3.0.jar' in installer
-assert 'ItemInHandLayer' in renderer and 'PlayerModel<' in renderer
+assert 'HeldItemLayer' in renderer and 'PlayerModel<' in renderer
 assert 'net.optifine' not in renderer and 'org.spongepowered.asm.mixin' not in renderer
 assert 'setDropChance(EquipmentSlotType.MAINHAND, -1.0F)' in entity
 for fragment in ('isAutonomous', 'toggleAutonomous', 'Cerebro.escolherTarefa', 'eatFromOwnBag', 'safeStand', 'rememberFailedTarget',
