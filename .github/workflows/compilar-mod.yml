@@ -42,10 +42,12 @@ jobs:
           chmod +x ./gradlew
 
 
+     
       - name: Compilar JAR Forge (inclui remapeamento)
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.gradle/caches/forge_gradle/mcp_repo/de/oceanlabs/mcp/mcp_config/1.16.5"
+          mkdir -p "$HOME/.gradle/caches/forge_gradle/minecraft_user_repo/de/oceanlabs/mcp/mcp_config/1.16.5-20210115.111550"
           ./gradlew --no-daemon --stacktrace --console=plain build
 
 
