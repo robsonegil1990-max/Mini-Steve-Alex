@@ -158,7 +158,7 @@ public class CompanheiroEntity extends CreatureEntity {
 
     @Override
     protected void registerGoals() {
-        goalSelector.addGoal(0, new FloatGoal(this));
+goalSelector.addGoal(0, new SwimGoal(this));
         goalSelector.addGoal(9, new RandomWalkingGoal(this, 0.65D, 160) {
             @Override public boolean canUse() {
                 return CompanheiroEntity.this.getJob() == Alvos.PARADO
