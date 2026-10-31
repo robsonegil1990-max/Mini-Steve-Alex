@@ -70,8 +70,32 @@ public class CompanheiroEntity extends CreatureEntity {
     private static final DataParameter<Boolean> FOLLOW = EntityDataManager.defineId(CompanheiroEntity.class, DataSerializers.BOOLEAN);
     private static final DataParameter<Boolean> RETURNING = EntityDataManager.defineId(CompanheiroEntity.class, DataSerializers.BOOLEAN);
     private static final DataParameter<Boolean> AUTO = EntityDataManager.defineId(CompanheiroEntity.class, DataSerializers.BOOLEAN);
+    // 0 parado, 1 minerando/cortando, 2 golpeando. Sincronizado para animar no cliente.
+    private static final int ACTION_IDLE = 0, ACTION_BREAK = 1, ACTION_ATTACK = 2;
+    private static final DataParameter<Integer> ACTION = EntityDataManager.defineId(CompanheiroEntity.class, DataSerializers.INT);
 
+    // Raio local de deteccao e raio maximo de exploracao (sem carregar chunks).
     private static final int RANGE = 16;
+    private static final int EXPLORE_RADIUS = 80;
+    private static final int EXPLORE_STEP = 12;
+    private static final int EXPLORE_REACH = 28;
+    private static final int MAX_SCOUT_TICKS = 220;
+    private static final List<BlockPos> SCOUT_SPOTS = createScoutSpots();
+
+    private static List<BlockPos> createScoutSpots() {
+        List<BlockPos> offsets = new ArrayList<>();
+        int sections = EXPLORE_RADIUS / EXPLORE_STEP;
+        for (int x = -sections; x <= sections; x++) {
+            for (int z = -sections; z <= sections; z++) {
+                int xx = x * EXPLORE_STEP;
+                int zz = z * EXPLORE_STEP;
+                if (xx * xx + zz * zz <= EXPLORE_RADIUS * EXPLORE_RADIUS) {
+                    offsets.add(new BlockPos(xx, 0, zz));
+                }
+            }
+        }
+        return Collections.unmodifiableList(offsets);
+    }
     private static final int HEIGHT = 8;
     private static final int WIDTH = RANGE * 2 + 1;
     // Ordens de busca: blocos mais proximos sao procurados primeiro, em vez de
@@ -102,6 +126,11 @@ public class CompanheiroEntity extends CreatureEntity {
     @Nullable private BlockPos standingBlock;
     @Nullable private LivingEntity targetMob;
     private int scanIndex;
+    // A busca local e repetida a cada novo ponto fisicamente visitado.
+    private BlockPos scanCenter = BlockPos.ZERO;
+    private final boolean[] scouted = new boolean[SCOUT_SPOTS.size()];
+    @Nullable private BlockPos scoutGoal;
+    private int scoutTicks;
     private int huntMisses;
     private int unreachableTicks;
     private int cooldown;
@@ -111,6 +140,15 @@ public class CompanheiroEntity extends CreatureEntity {
     private int workActions;
     private int healingTicks;
     private boolean recoveryPause;
+    // Progresso visual REAL da quebra (cada etapa e enviada aos jogadores proximos).
+    @Nullable private BlockPos breakingBlock;
+    private int breakingTicks;
+    private int breakingDuration;
+    private int breakingStage = -1;
+    private int combatPoseTicks;
+    private int autonomousActions;
+    private int autoTaskDeadline;
+    private boolean switchAfterAttack;
     private int nextAutoAttempt;
     private int lastAutoJob;
     private int authorisedJobs; // apenas categorias que o dono escolheu manualmente
@@ -140,7 +178,7 @@ public class CompanheiroEntity extends CreatureEntity {
         return CreatureEntity.createMobAttributes()
                 .add(Attributes.MAX_HEALTH, 16.0D)
                 .add(Attributes.MOVEMENT_SPEED, 0.27D)
-                .add(Attributes.FOLLOW_RANGE, 24.0D)
+                .add(Attributes.FOLLOW_RANGE, 32.0D)
                 .add(Attributes.ATTACK_DAMAGE, 2.0D);
     }
 
@@ -154,11 +192,12 @@ public class CompanheiroEntity extends CreatureEntity {
         entityData.define(FOLLOW, true);
         entityData.define(RETURNING, false);
         entityData.define(AUTO, false);
+        entityData.define(ACTION, ACTION_IDLE);
     }
 
     @Override
     protected void registerGoals() {
-goalSelector.addGoal(0, new SwimGoal(this));
+        goalSelector.addGoal(0, new SwimGoal(this));
         goalSelector.addGoal(9, new RandomWalkingGoal(this, 0.65D, 160) {
             @Override public boolean canUse() {
                 return CompanheiroEntity.this.getJob() == Alvos.PARADO
@@ -179,6 +218,8 @@ goalSelector.addGoal(0, new SwimGoal(this));
     public boolean isFollowing() { return entityData.get(FOLLOW); }
     public boolean isReturning() { return entityData.get(RETURNING); }
     public boolean isAutonomous() { return entityData.get(AUTO); }
+    public boolean isBreakingBlockAnimation() { return entityData.get(ACTION) == ACTION_BREAK; }
+    public boolean isAttackingAnimation() { return entityData.get(ACTION) == ACTION_ATTACK; }
 
     public void initializeOwner(UUID uuid, BlockPos place, boolean alex) {
         ownerId = uuid;
@@ -198,7 +239,9 @@ goalSelector.addGoal(0, new SwimGoal(this));
     /** Tarefas manuais registram preferencias que a IA pode usar futuramente. */
     public void setOrder(int job, int choice) {
         if (!Alvos.valid(job, choice)) return;
-        entityData.set(AUTO, false);
+        // Ao escolher mais um alvo com IA ativa, a IA permanece ligada.
+        // O comando Parar e que desativa o modo automatico.
+        if (job == Alvos.PARADO) entityData.set(AUTO, false);
         if (job != Alvos.PARADO) {
             authorisedJobs |= 1 << (job - 1);
             preferredTarget[job] = choice;
@@ -208,18 +251,29 @@ goalSelector.addGoal(0, new SwimGoal(this));
     }
 
     private void configureJob(int job, int choice, boolean changeHome) {
+        stopBreakingAnimation();
+        combatPoseTicks = 0;
+        switchAfterAttack = false;
+        entityData.set(ACTION, ACTION_IDLE);
         entityData.set(JOB, job);
         entityData.set(CHOICE, choice);
         entityData.set(RETURNING, false);
         if (changeHome) home = blockPosition().immutable();
         scanIndex = 0;
+        scanCenter = blockPosition().immutable();
+        Arrays.fill(scouted, false);
+        scoutGoal = null;
+        scoutTicks = 0;
         huntMisses = 0;
         targetBlock = null;
         standingBlock = null;
         targetMob = null;
         attackedCurrentTarget = false;
-        pickupWindow = 0;
-        pickupPosition = null;
+        // No modo IA, conserva por alguns segundos os drops de uma caca anterior.
+        if (!isAutonomous()) {
+            pickupWindow = 0;
+            pickupPosition = null;
+        }
         unreachableTicks = 0;
         getNavigation().stop();
         refreshHeldItem();
@@ -234,17 +288,35 @@ goalSelector.addGoal(0, new SwimGoal(this));
             player.displayClientMessage(new StringTextComponent("IA desligada. Voltando ao dono."), true);
             return;
         }
-        if (authorisedJobs == 0) {
-            player.displayClientMessage(new StringTextComponent("Escolha ao menos uma tarefa antes de ligar a IA."), true);
+        // Modo automatico agora descobre categorias SEGURAS com ferramentas equipadas.
+        // Categorias adicionadas implicitamente buscam carvao, carvalho e vacas.
+        // Monstros NUNCA sao habilitados automaticamente.
+        for (int job = Alvos.MINERAR; job <= Alvos.CACAR; job++) {
+            int bit = 1 << (job - 1);
+            if ((authorisedJobs & bit) == 0 && hasToolFor(job, 0)) {
+                authorisedJobs |= bit;
+                preferredTarget[job] = 0;
+            }
+        }
+        boolean hasAny = false;
+        for (int job = 1; job <= 4; job++) {
+            if ((authorisedJobs & (1 << (job - 1))) != 0 && hasToolFor(job, preferredTarget[job])) {
+                hasAny = true;
+            }
+        }
+        if (!hasAny) {
+            player.displayClientMessage(new StringTextComponent("IA: equipe ferramenta adequada (Shift + clique direito)."), true);
             return;
         }
         entityData.set(AUTO, true);
         home = blockPosition().immutable();
         Arrays.fill(blockedJobUntil, 0);
         nextAutoAttempt = 0;
+        // Garante rotacao perceptivel, em vez de repetir a ordem manual indefinidamente.
         lastAutoJob = getJob();
+        autonomousActions = 0;
         chooseNextAutonomousJob();
-        player.displayClientMessage(new StringTextComponent("IA ligada! So executara tarefas autorizadas por voce."), true);
+        player.displayClientMessage(new StringTextComponent("IA AUTOMATICA ligada: explorando com ferramentas disponiveis!"), true);
     }
 
     private void chooseNextAutonomousJob() {
@@ -260,7 +332,15 @@ goalSelector.addGoal(0, new SwimGoal(this));
             nextAutoAttempt = tickCount + 200;
         } else {
             lastAutoJob = next;
+            autonomousActions = 0;
+            autoTaskDeadline = tickCount + 500;
             configureJob(next, preferredTarget[next], false);
+            PlayerEntity owner = ownerNearby();
+            if (owner != null) {
+                String tipo = next == Alvos.MINERAR ? "minerio" : next == Alvos.MADEIRA ? "madeira"
+                        : next == Alvos.CACAR ? "animais" : "monstros";
+                owner.displayClientMessage(new StringTextComponent("IA: explorando em busca de " + tipo + "."), true);
+            }
         }
     }
 
@@ -401,6 +481,15 @@ goalSelector.addGoal(0, new SwimGoal(this));
         super.aiStep();
         if (level.isClientSide || ownerId == null) return;
         if (cooldown > 0) cooldown--;
+        if (combatPoseTicks > 0 && --combatPoseTicks == 0 && entityData.get(ACTION) == ACTION_ATTACK) {
+            entityData.set(ACTION, ACTION_IDLE);
+            if (switchAfterAttack) {
+                switchAfterAttack = false;
+                // Guarda os drops da vitima antes de sair para outra tarefa.
+                if (pickupWindow > 0) collectNearbyDrops();
+                completedAutonomousAction();
+            }
+        }
         if (pickupWindow > 0) pickupWindow--;
         else pickupPosition = null;
         if (pickupWindow > 0 && tickCount % 8 == 0) collectNearbyDrops();
@@ -414,6 +503,7 @@ goalSelector.addGoal(0, new SwimGoal(this));
         if (getFoodLevel() <= 6) eatFromOwnBag();
         if (!recoveryPause && (isOnFire() || getHealth() <= getMaxHealth() * .32F)) {
             recoveryPause = true;
+            stopBreakingAnimation();
             getNavigation().stop();
         }
         if (recoveryPause) {
@@ -436,11 +526,20 @@ goalSelector.addGoal(0, new SwimGoal(this));
                 false, isFull(), hasRequiredTool());
         if (plan == Cerebro.GUARDAR_ITENS) { finishJob(); return; }
         if (plan == Cerebro.VOLTAR || plan == Cerebro.TROCAR_FERRAMENTA) {
+            stopBreakingAnimation();
             getNavigation().stop();
             followOwnerTick();
             return;
         }
-        if (blockPosition().distSqr(home) > (RANGE + 5) * (RANGE + 5)) {
+        // A IA nao fica eternamente numa categoria sem resultados.
+        if (isAutonomous() && tickCount >= autoTaskDeadline) {
+            blockedJobUntil[getJob()] = tickCount + 200;
+            chooseNextAutonomousJob();
+            return;
+        }
+        // Nunca vagueia infinitamente: explora em torno do ponto da ordem.
+        // Os chunks alem do carregamento normal do jogador nao sao ativados.
+        if (blockPosition().distSqr(home) > (EXPLORE_RADIUS + 6) * (EXPLORE_RADIUS + 6)) {
             if (tickCount % 24 == 0) getNavigation().moveTo(home.getX() + .5D, home.getY(), home.getZ() + .5D, 1.0D);
             return;
         }
@@ -515,7 +614,10 @@ goalSelector.addGoal(0, new SwimGoal(this));
 
     private void gatherTick() {
         if (targetBlock == null) {
-            if (tickCount % 8 == 0) scanForBlocks(260);
+            // Em vez de ficar procurando para sempre no mesmo lugar, caminhe
+            // para o proximo setor e faca uma nova busca ali.
+            if (scoutGoal != null) advanceScout();
+            else if (tickCount % 4 == 0) scanForBlocks(300);
             return;
         }
         if (standingBlock == null || !level.isLoaded(targetBlock) || !isDesiredBlock(targetBlock)) {
@@ -536,13 +638,41 @@ goalSelector.addGoal(0, new SwimGoal(this));
         ItemStack tool = tools.get(slot);
         BlockPos pos = targetBlock;
         if (!level.isLoaded(pos) || !isDesiredBlock(pos)) { clearTarget(); return; }
-        if (!safeStand(standingBlock)) { rememberFailedTarget(pos); clearTarget(); return; }
+        if (!safeStand(standingBlock) || tool.isEmpty()) {
+            rememberFailedTarget(pos); clearTarget(); return;
+        }
         BlockState state = level.getBlockState(pos);
         ServerWorld server = (ServerWorld) level;
+        if (breakingBlock == null || !breakingBlock.equals(pos)) {
+            stopBreakingAnimation();
+            float hardness = state.getDestroySpeed(level, pos);
+            if (hardness < 0) { rememberFailedTarget(pos); clearTarget(); return; }
+            breakingBlock = pos.immutable();
+            breakingTicks = 0;
+            breakingStage = -1;
+            int tier = tool.getItem() instanceof TieredItem ? ((TieredItem) tool.getItem()).getTier().getLevel() : 0;
+            // Mais duros levam mais tempo. Cada bloco leva ao menos 24 ticks
+            // para as rachaduras serem perceptiveis, sem mineracao instantanea.
+            breakingDuration = Math.max(24, Math.min(160,
+                    Math.round((22.0F + hardness * 15.0F) / (1.0F + tier * 0.20F))));
+            entityData.set(ACTION, ACTION_BREAK);
+        }
+        getLookControl().setLookAt(pos.getX() + .5D, pos.getY() + .5D, pos.getZ() + .5D);
+        if (breakingTicks % 8 == 0) swing(Hand.MAIN_HAND);
+        breakingTicks++;
+        int stage = Math.min(9, (breakingTicks * 10) / breakingDuration);
+        if (stage != breakingStage) {
+            breakingStage = stage;
+            server.destroyBlockProgress(getId(), pos, stage);
+        }
+        if (breakingTicks < breakingDuration) return;
+
+        // Recursos continuam vindo APENAS do bloco existente no mundo.
         List<ItemStack> loot = Block.getDrops(state, server, pos, level.getBlockEntity(pos), this, tool);
-        // Colhe somente o bloco achado fisicamente. Nunca inventa itens nem usa raio-X.
-        if (level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)) {
-            swing(Hand.MAIN_HAND);
+        boolean broke = level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+        if (broke) {
+            // Efeito vanilla de fragmentos e som de quebra, alem das rachaduras graduais.
+            server.levelEvent(2001, pos, Block.getId(state));
             for (ItemStack drop : loot) {
                 ItemStack remain = store(drop.copy());
                 if (!remain.isEmpty()) Block.popResource(level, pos, remain);
@@ -550,15 +680,33 @@ goalSelector.addGoal(0, new SwimGoal(this));
             damageTool(slot);
             successes[job] = Math.min(100, successes[job] + 1);
             spendEnergy();
-            cooldown = job == Alvos.MINERAR ? 55 : 44;
+            cooldown = job == Alvos.MINERAR ? 15 : 12;
         }
         clearTarget();
+        if (broke) completedAutonomousAction();
+    }
+
+    private void stopBreakingAnimation() {
+        if (breakingBlock != null && !level.isClientSide) {
+            ((ServerWorld) level).destroyBlockProgress(getId(), breakingBlock, -1);
+        }
+        breakingBlock = null;
+        breakingTicks = 0;
+        breakingDuration = 0;
+        breakingStage = -1;
+        if (entityData.get(ACTION) == ACTION_BREAK) entityData.set(ACTION, ACTION_IDLE);
+    }
+
+    /** Apos dois trabalhos concluidos, troca de categoria se a IA estiver ligada. */
+    private void completedAutonomousAction() {
+        if (!isAutonomous() || getJob() == Alvos.PARADO) return;
+        if (++autonomousActions >= 2) chooseNextAutonomousJob();
     }
 
     private void scanForBlocks(int budget) {
         for (int searched = 0; searched < budget; searched++) {
-            if (scanIndex >= SEARCH_ORDER.size()) { finishJob(); return; }
-            BlockPos pos = home.offset(SEARCH_ORDER.get(scanIndex++));
+            if (scanIndex >= SEARCH_ORDER.size()) { startNextScoutLeg(); return; }
+            BlockPos pos = scanCenter.offset(SEARCH_ORDER.get(scanIndex++));
             if (!level.isLoaded(pos) || isTemporarilyBlocked(pos) || !isDesiredBlock(pos)) continue;
             BlockPos stand = findStand(pos);
             if (stand == null) continue;
@@ -571,6 +719,100 @@ goalSelector.addGoal(0, new SwimGoal(this));
                 clearTarget();
             }
             return;
+        }
+    }
+
+    /** Busca pontos seguros a ~12 blocos de distancia, avancando ate 80 blocos.
+     *  Cada novo ponto recebe uma varredura local completa.
+     */
+    private void startNextScoutLeg() {
+        BlockPos here = blockPosition();
+        for (int attempt = 0; attempt < 8; attempt++) {
+            int bestIndex = -1;
+            BlockPos bestSpot = null;
+            double bestDistance = Double.MAX_VALUE;
+            for (int i = 0; i < SCOUT_SPOTS.size(); i++) {
+                if (scouted[i]) continue;
+                BlockPos offset = SCOUT_SPOTS.get(i);
+                BlockPos intended = home.offset(offset);
+                if (!level.isLoaded(intended)) continue;
+                // Nao tenta atravessar o mapa diretamente: avanca um setor por vez.
+                int dx = intended.getX() - here.getX();
+                int dz = intended.getZ() - here.getZ();
+                int horizontalSq = dx * dx + dz * dz;
+                if (horizontalSq <= 16) { scouted[i] = true; continue; }
+                if (horizontalSq > EXPLORE_REACH * EXPLORE_REACH) continue;
+                BlockPos stand = findScoutStand(intended.getX(), intended.getZ());
+                if (stand == null) continue;
+                if (Math.abs(stand.getY() - here.getY()) > 7) continue;
+                double distance = here.distSqr(stand);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = i;
+                    bestSpot = stand;
+                }
+            }
+            if (bestIndex == -1) { finishJob(); return; }
+            // Tambem evita retornar para locais que o pathfinder considera inacessiveis.
+            scouted[bestIndex] = true;
+            if (bestSpot != null && getNavigation().moveTo(
+                    bestSpot.getX() + 0.5D, bestSpot.getY(), bestSpot.getZ() + 0.5D, 1.03D)) {
+                scoutGoal = bestSpot.immutable();
+                scoutTicks = 0;
+                return;
+            }
+        }
+        // Todos os pontos proximos falharam; nao cria ticks infinitos de pathfinding.
+        finishJob();
+    }
+
+    /** Procura chao firme no mesmo nivel de jogo (inclui cavernas). */
+    @Nullable
+    private BlockPos findScoutStand(int x, int z) {
+        int baseY = blockPosition().getY();
+        for (int offset = 0; offset <= 8; offset++) {
+            for (int sign = -1; sign <= 1; sign += 2) {
+                if (offset == 0 && sign == 1) continue;
+                BlockPos pos = new BlockPos(x, baseY + offset * sign, z);
+                if (!level.isLoaded(pos) || !level.isLoaded(pos.above()) || !level.isLoaded(pos.below())) continue;
+                if (safeStand(pos)) return pos;
+            }
+        }
+        return null;
+    }
+
+    private void advanceScout() {
+        if (scoutGoal == null) return;
+        double d = distanceToSqr(scoutGoal.getX() + .5D, scoutGoal.getY(), scoutGoal.getZ() + .5D);
+        if (d <= 4.0D) {
+            scanCenter = blockPosition().immutable();
+            scanIndex = 0;
+            huntMisses = 0;
+            scoutGoal = null;
+            scoutTicks = 0;
+            getNavigation().stop();
+            return;
+        }
+        scoutTicks++;
+        if (scoutTicks > MAX_SCOUT_TICKS) {
+            scoutGoal = null;
+            scoutTicks = 0;
+            scanCenter = blockPosition().immutable();
+            scanIndex = 0;
+            getNavigation().stop();
+            return;
+        }
+        if (tickCount % 24 == 0 && !getNavigation().moveTo(
+                scoutGoal.getX() + .5D, scoutGoal.getY(), scoutGoal.getZ() + .5D, 1.03D)) {
+            scoutGoal = null;
+            scoutTicks = 0;
+            scanCenter = blockPosition().immutable();
+            scanIndex = 0;
+            getNavigation().stop();
+        }
+        // A caminhada tambem consome fome; nao e transporte gratis de recursos.
+        if (tickCount % 240 == 0) {
+            entityData.set(FOOD, Regras.reduzirFome(getFoodLevel(), 1));
         }
     }
 
@@ -661,6 +903,7 @@ goalSelector.addGoal(0, new SwimGoal(this));
     private void huntTick() {
         EntityType<?> wanted = Alvos.targetMob(getJob(), getChoice());
         if (wanted == null) { finishJob(); return; }
+        if (scoutGoal != null) { advanceScout(); return; }
         if (targetMob != null && !targetMob.isAlive() && attackedCurrentTarget) {
             // So recolhe drops quando o alvo que o mini atingiu realmente morreu.
             pickupPosition = targetMob.blockPosition().immutable();
@@ -671,7 +914,7 @@ goalSelector.addGoal(0, new SwimGoal(this));
             targetMob = null;
             attackedCurrentTarget = false;
             if (tickCount % 70 != 0) return;
-            AxisAlignedBB area = new AxisAlignedBB(home).inflate(RANGE, HEIGHT, RANGE);
+            AxisAlignedBB area = new AxisAlignedBB(blockPosition()).inflate(RANGE, HEIGHT, RANGE);
             List<LivingEntity> nearby = level.getEntitiesOfClass(LivingEntity.class, area,
                     mob -> mob.isAlive() && !mob.hasCustomName() && mob.getType() == wanted
                             && (!(mob instanceof AnimalEntity) || !((AnimalEntity) mob).isBaby())
@@ -682,14 +925,14 @@ goalSelector.addGoal(0, new SwimGoal(this));
                 if (mob.distanceToSqr(this) < best) { best = mob.distanceToSqr(this); targetMob = mob; }
             }
             if (targetMob == null) {
-                if (++huntMisses >= 5) finishJob();
+                if (++huntMisses >= 2) { huntMisses = 0; startNextScoutLeg(); }
                 return;
             }
             huntMisses = 0;
             unreachableTicks = 0;
             attackedCurrentTarget = false;
         }
-        if (targetMob.blockPosition().distSqr(home) > (RANGE + 2) * (RANGE + 2)
+        if (targetMob.blockPosition().distSqr(home) > (EXPLORE_RADIUS + 2) * (EXPLORE_RADIUS + 2)
                 || (level.isLoaded(targetMob.blockPosition())
                     && dangerous(level.getBlockState(targetMob.blockPosition()).getBlock()))) {
             targetMob = null;
@@ -709,16 +952,23 @@ goalSelector.addGoal(0, new SwimGoal(this));
         if (cooldown > 0) return;
         ItemStack sword = tools.get(SWORD);
         int tier = ((TieredItem) sword.getItem()).getTier().getLevel();
+        entityData.set(ACTION, ACTION_ATTACK);
+        combatPoseTicks = 10;
         swing(Hand.MAIN_HAND);
+        boolean killed = false;
         if (targetMob.hurt(DamageSource.mobAttack(this), 2.0F + Math.min(tier, 4) * 0.85F)) {
             // Monstros podem reagir ao ataque. Caçar continua tendo risco real.
             if (targetMob instanceof MonsterEntity) ((MonsterEntity) targetMob).setTarget(this);
             damageTool(SWORD);
-            if (!targetMob.isAlive()) successes[getJob()] = Math.min(100, successes[getJob()] + 1);
+            if (!targetMob.isAlive()) {
+                successes[getJob()] = Math.min(100, successes[getJob()] + 1);
+                killed = true;
+            }
             spendEnergy();
             attackedCurrentTarget = true;
         }
         cooldown = 25;
+        if (killed) switchAfterAttack = true;
     }
 
     private void collectNearbyDrops() {
@@ -769,6 +1019,7 @@ goalSelector.addGoal(0, new SwimGoal(this));
     }
 
     private void clearTarget() {
+        stopBreakingAnimation();
         targetBlock = null;
         standingBlock = null;
         unreachableTicks = 0;
@@ -777,6 +1028,7 @@ goalSelector.addGoal(0, new SwimGoal(this));
 
     @Override
     protected void dropCustomDeathLoot(DamageSource damage, int looting, boolean hitByPlayer) {
+        stopBreakingAnimation();
         super.dropCustomDeathLoot(damage, looting, hitByPlayer);
         for (int i = 0; i < tools.size(); i++) {
             if (!tools.get(i).isEmpty()) spawnAtLocation(tools.get(i).copy());
@@ -807,6 +1059,9 @@ goalSelector.addGoal(0, new SwimGoal(this));
         tag.putIntArray("Preferences", preferences);
         tag.putIntArray("Successes", successes);
         tag.putInt("WorkActions", workActions);
+        int[] seen = new int[scouted.length];
+        for (int i = 0; i < scouted.length; i++) seen[i] = scouted[i] ? 1 : 0;
+        tag.putIntArray("ExplorationSeen", seen);
         for (int i = 0; i < 3; i++) if (!tools.get(i).isEmpty()) tag.put("Tool" + i, tools.get(i).save(new CompoundNBT()));
         ListNBT saved = new ListNBT();
         for (int i = 0; i < STORAGE_SIZE; i++) {
@@ -822,6 +1077,10 @@ goalSelector.addGoal(0, new SwimGoal(this));
     @Override
     public void readAdditionalSaveData(CompoundNBT tag) {
         super.readAdditionalSaveData(tag);
+        entityData.set(ACTION, ACTION_IDLE);
+        breakingBlock = null;
+        breakingTicks = 0;
+        combatPoseTicks = 0;
         if (tag.hasUUID("Owner")) ownerId = tag.getUUID("Owner");
         home = tag.contains("Home") ? BlockPos.of(tag.getLong("Home")) : blockPosition();
         entityData.set(ALEX, tag.getBoolean("Alex"));
@@ -842,6 +1101,12 @@ goalSelector.addGoal(0, new SwimGoal(this));
             }
         }
         workActions = tag.getInt("WorkActions");
+        scanCenter = blockPosition().immutable();
+        scanIndex = 0;
+        scoutGoal = null;
+        scoutTicks = 0;
+        int[] seen = tag.getIntArray("ExplorationSeen");
+        for (int i = 0; i < scouted.length && i < seen.length; i++) scouted[i] = seen[i] != 0;
         for (int i = 0; i < 3; i++) {
             tools.set(i, tag.contains("Tool" + i) ? ItemStack.of(tag.getCompound("Tool" + i)) : ItemStack.EMPTY);
         }
@@ -866,3 +1131,108 @@ goalSelector.addGoal(0, new SwimGoal(this));
         }
     }
 }
+
+package br.com.minicompanheiros.client;
+
+import br.com.minicompanheiros.CompanheiroEntity;
+import com.mojang.blaze3d.matrix.MatrixStack;
+import net.minecraft.client.renderer.IRenderTypeBuffer;
+import net.minecraft.client.renderer.entity.EntityRendererManager;
+import net.minecraft.client.renderer.entity.MobRenderer;
+import net.minecraft.client.renderer.entity.layers.HeldItemLayer;
+import net.minecraft.client.renderer.entity.model.BipedModel;
+import net.minecraft.client.renderer.entity.model.PlayerModel;
+import net.minecraft.util.ResourceLocation;
+import net.minecraft.util.math.MathHelper;
+
+/** Modelo vanilla com animacao dedicada para mineracao, madeira e combate. */
+public class RenderCompanheiro extends MobRenderer<CompanheiroEntity, PlayerModel<CompanheiroEntity>> {
+    private static final ResourceLocation STEVE = new ResourceLocation("minecraft", "textures/entity/steve.png");
+    private static final ResourceLocation ALEX = new ResourceLocation("minecraft", "textures/entity/alex.png");
+    private final PlayerModel<CompanheiroEntity> normal = new AnimatedModel(false);
+    private final PlayerModel<CompanheiroEntity> slim = new AnimatedModel(true);
+
+    public RenderCompanheiro(EntityRendererManager manager) {
+        super(manager, new AnimatedModel(false), 0.24F);
+        // Espada, picareta e machado continuam visiveis na mao.
+        addLayer(new HeldItemLayer<>(this));
+    }
+
+    @Override
+    public ResourceLocation getTextureLocation(CompanheiroEntity helper) {
+        return helper.isAlex() ? ALEX : STEVE;
+    }
+
+    @Override
+    public void render(CompanheiroEntity helper, float yaw, float partialTicks,
+                       MatrixStack matrix, IRenderTypeBuffer buffer, int light) {
+        this.model = helper.isAlex() ? slim : normal;
+        this.model.rightArmPose = helper.getMainHandItem().isEmpty()
+                ? BipedModel.ArmPose.EMPTY : BipedModel.ArmPose.ITEM;
+        matrix.pushPose();
+        try {
+            matrix.scale(0.63F, 0.63F, 0.63F);
+            super.render(helper, yaw, partialTicks, matrix, buffer, light);
+        } finally {
+            matrix.popPose();
+        }
+    }
+
+    private static final class AnimatedModel extends PlayerModel<CompanheiroEntity> {
+        private AnimatedModel(boolean slim) { super(0.0F, slim); }
+
+        @Override
+        public void setupAnim(CompanheiroEntity helper, float limbSwing, float limbSwingAmount,
+                              float ageInTicks, float headYaw, float headPitch) {
+            super.setupAnim(helper, limbSwing, limbSwingAmount, ageInTicks, headYaw, headPitch);
+            if (helper.isBreakingBlockAnimation()) {
+                // Golpe para baixo, repetido, como um jogador minerando ou cortando lenha.
+                this.rightArm.xRot = -1.5F + 0.60F * MathHelper.sin(ageInTicks * 1.45F);
+                this.rightArm.yRot = -0.15F;
+            } else if (helper.isAttackingAnimation()) {
+                // Ataque rapido com a espada (sinc. do servidor para clientes).
+                this.rightArm.xRot = -1.2F + 0.7F * MathHelper.sin(ageInTicks * 2.1F);
+                this.rightArm.yRot = -0.30F;
+            }
+            // A manga acompanha o braco, evitando desencaixe visual.
+            this.rightSleeve.xRot = this.rightArm.xRot;
+            this.rightSleeve.yRot = this.rightArm.yRot;
+            this.rightSleeve.zRot = this.rightArm.zRot;
+        }
+    }
+}
+
+MINI STEVE & MINI ALEX - IA + ANIMACOES (V0.5)
+Minecraft 1.16.5 | Forge 36.1.0 | OptiFine HD U G8: COMPATIBILIDADE A TESTAR
+
+ATUALIZACAO MINIMA DO MOD QUE VOCE JA COMPILOU NO GITHUB:
+
+1) Em seu GitHub, abra:
+   src/main/java/br/com/minicompanheiros/CompanheiroEntity.java
+   Clique no lapis (editar), apague todo o conteudo e cole o texto do
+   CompanheiroEntity.java NOVO que esta neste pacote. Commit changes.
+
+2) Faca a mesma coisa no caminho:
+   src/main/java/br/com/minicompanheiros/client/RenderCompanheiro.java
+   usando o RenderCompanheiro.java NOVO. Commit changes.
+
+3) Actions -> Compilar Mini Steve e Mini Alex 1.16.5 -> Run workflow.
+   Se ficar VERDE, abra a execucao e baixe o Artifacts do .jar.
+   Se ficar VERMELHO, copie as primeiras linhas com 'error:' e envie ao ChatGPT.
+
+4) Remova o .jar ANTIGO da pasta mods. Coloque somente o .jar NOVO.
+   Teste primeiro em COPIA do mundo, sem OptiFine, depois com OptiFine.
+
+TESTE COMPORTAMENTO:
+- Equipe o mini com picareta (Shift+clique direito) e machado.
+- IA LIGADA: deve alternar minerar carvao, cortar carvalho e cacas de vacas
+  (se houver espada), usando apenas categorias para as quais tem ferramentas.
+- O menu manual ainda permite escolher outro minerio, madeira ou animal.
+- Monstros continuam so com ordem explicita; a IA nao habilita monstros sozinha.
+- Ao encostar no alvo, ele deve mover o braco por varios ticks.
+- O bloco deve ficar rachado (10 estagios) antes de desaparecer.
+- Se interromper a ordem, as rachaduras devem desaparecer.
+
+OBS: Mantivemos o nome do arquivo JAR da versao 0.3.0 para evitar editar
+outros arquivos do seu projeto. O CODIGO e V0.5.
+NAO E UM JAR PRE-COMPILADO. A compilacao Forge precisa passar no GitHub.
