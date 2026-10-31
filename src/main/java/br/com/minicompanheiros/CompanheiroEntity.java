@@ -1,26 +1,3 @@
-MINI STEVE / MINI ALEX - V0.6 (TUNEIS + ALCANCE DE JOGADOR)
-
-VOCE SUBSTITUI SOMENTE O CompanheiroEntity.java. NAO CRIE UM REPOSITORIO NOVO.
-
-1. Extraia o CompanheiroEntity.java deste ZIP.
-2. Abra no GitHub:
-https://github.com/robsonegil1990-max/Mini-Steve-Alex/edit/main/src/main/java/br/com/minicompanheiros/CompanheiroEntity.java
-3. Abra o novo arquivo com Bloco de Notas. Ctrl+A, Ctrl+C.
-4. No editor do GitHub: clique dentro do CODIGO, Ctrl+A, Delete e Ctrl+V.
-5. Clique em Commit changes.
-6. Abra Actions > Compilar Mini Steve e Mini Alex 1.16.5 > Run workflow.
-7. Se ficar verde: Artifacts > baixar ZIP > extrair JAR > substituir JAR antigo.
-
-MODIFICACOES:
-- Mineracao: ate 4.5 blocos, sem atravessar blocos.
-- Combate: ate 3 blocos, sem atraves de paredes.
-- Escolhendo MINERAR > DIAMANTE, mini cava escada ate Y11 e tuneis 2 altos.
-- Tenta contornar perigos e caminhos impossiveis; nao carrega chunks novos.
-- Melhor procura por arvores, animais e minerios de superficie.
-
-CUIDADO: mineroes e pedra/terra podem ser removidas do mundo. Teste numa copia.
-Ainda precisa compilar no GitHub e testar in-game.
-
 package br.com.minicompanheiros;
 
 import br.com.minicompanheiros.network.MensagemEstado;
