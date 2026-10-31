@@ -1,3 +1,26 @@
+MINI STEVE / MINI ALEX - V0.6 (TUNEIS + ALCANCE DE JOGADOR)
+
+VOCE SUBSTITUI SOMENTE O CompanheiroEntity.java. NAO CRIE UM REPOSITORIO NOVO.
+
+1. Extraia o CompanheiroEntity.java deste ZIP.
+2. Abra no GitHub:
+https://github.com/robsonegil1990-max/Mini-Steve-Alex/edit/main/src/main/java/br/com/minicompanheiros/CompanheiroEntity.java
+3. Abra o novo arquivo com Bloco de Notas. Ctrl+A, Ctrl+C.
+4. No editor do GitHub: clique dentro do CODIGO, Ctrl+A, Delete e Ctrl+V.
+5. Clique em Commit changes.
+6. Abra Actions > Compilar Mini Steve e Mini Alex 1.16.5 > Run workflow.
+7. Se ficar verde: Artifacts > baixar ZIP > extrair JAR > substituir JAR antigo.
+
+MODIFICACOES:
+- Mineracao: ate 4.5 blocos, sem atravessar blocos.
+- Combate: ate 3 blocos, sem atraves de paredes.
+- Escolhendo MINERAR > DIAMANTE, mini cava escada ate Y11 e tuneis 2 altos.
+- Tenta contornar perigos e caminhos impossiveis; nao carrega chunks novos.
+- Melhor procura por arvores, animais e minerios de superficie.
+
+CUIDADO: mineroes e pedra/terra podem ser removidas do mundo. Teste numa copia.
+Ainda precisa compilar no GitHub e testar in-game.
+
 package br.com.minicompanheiros;
 
 import br.com.minicompanheiros.network.MensagemEstado;
@@ -41,6 +64,10 @@ import net.minecraft.util.Hand;
 import net.minecraft.util.NonNullList;
 import net.minecraft.util.math.AxisAlignedBB;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.BlockRayTraceResult;
+import net.minecraft.util.math.RayTraceContext;
+import net.minecraft.util.math.RayTraceResult;
+import net.minecraft.util.math.vector.Vector3d;
 import net.minecraft.util.text.StringTextComponent;
 import net.minecraft.world.World;
 import net.minecraft.world.server.ServerWorld;
@@ -77,6 +104,12 @@ public class CompanheiroEntity extends CreatureEntity {
     // Raio local de deteccao e raio maximo de exploracao (sem carregar chunks).
     private static final int RANGE = 16;
     private static final int EXPLORE_RADIUS = 80;
+    // Survival 1.16.5: 4.5 blocks for blocks; 3 blocks for melee.
+    private static final double BLOCK_REACH = 4.5D;
+    private static final double MELEE_REACH = 3.0D;
+    private static final int DIAMOND_CHOICE = 3;
+    private static final int DIAMOND_TUNNEL_Y = 11;
+    private static final int MAX_TUNNEL_STEPS = 200;
     private static final int EXPLORE_STEP = 12;
     private static final int EXPLORE_REACH = 28;
     private static final int MAX_SCOUT_TICKS = 220;
@@ -146,6 +179,17 @@ public class CompanheiroEntity extends CreatureEntity {
     private int breakingDuration;
     private int breakingStage = -1;
     private int combatPoseTicks;
+    // State machine: safe two-block-high stairs down to Y=11, then branch tunnels.
+    @Nullable private BlockPos tunnelNextFoot;
+    @Nullable private Direction tunnelDirection;
+    private int tunnelSteps;
+    private int tunnelMoveTicks;
+    private int tunnelFailedDirections;
+    private int tunnelSegmentSteps;
+    private int tunnelSegmentLength = 8;
+    private int tunnelTurns;
+    private BlockPos lastScoutPosition = BlockPos.ZERO;
+    private int scoutStuckChecks;
     private int autonomousActions;
     private int autoTaskDeadline;
     private boolean switchAfterAttack;
@@ -264,6 +308,15 @@ public class CompanheiroEntity extends CreatureEntity {
         Arrays.fill(scouted, false);
         scoutGoal = null;
         scoutTicks = 0;
+        tunnelNextFoot = null;
+        tunnelDirection = null;
+        tunnelSteps = 0;
+        tunnelMoveTicks = 0;
+        tunnelFailedDirections = 0;
+        tunnelSegmentSteps = 0;
+        tunnelSegmentLength = 8;
+        tunnelTurns = 0;
+        scoutStuckChecks = 0;
         huntMisses = 0;
         targetBlock = null;
         standingBlock = null;
@@ -333,7 +386,9 @@ public class CompanheiroEntity extends CreatureEntity {
         } else {
             lastAutoJob = next;
             autonomousActions = 0;
-            autoTaskDeadline = tickCount + 500;
+            // Diamond stair-mining can take several real Minecraft minutes.
+            autoTaskDeadline = tickCount + (next == Alvos.MINERAR && preferredTarget[next] == DIAMOND_CHOICE
+                    ? 9600 : 1000);
             configureJob(next, preferredTarget[next], false);
             PlayerEntity owner = ownerNearby();
             if (owner != null) {
@@ -537,9 +592,11 @@ public class CompanheiroEntity extends CreatureEntity {
             chooseNextAutonomousJob();
             return;
         }
-        // Nunca vagueia infinitamente: explora em torno do ponto da ordem.
-        // Os chunks alem do carregamento normal do jogador nao sao ativados.
-        if (blockPosition().distSqr(home) > (EXPLORE_RADIUS + 6) * (EXPLORE_RADIUS + 6)) {
+        // Horizontal limit: a downward staircase should not consume radius in Y.
+        // Does not force-load chunks outside the owner's normal render distance.
+        double dxHome = getX() - home.getX(), dzHome = getZ() - home.getZ();
+        if (dxHome * dxHome + dzHome * dzHome
+                > (EXPLORE_RADIUS + 6) * (EXPLORE_RADIUS + 6)) {
             if (tickCount % 24 == 0) getNavigation().moveTo(home.getX() + .5D, home.getY(), home.getZ() + .5D, 1.0D);
             return;
         }
@@ -614,49 +671,74 @@ public class CompanheiroEntity extends CreatureEntity {
 
     private void gatherTick() {
         if (targetBlock == null) {
-            // Em vez de ficar procurando para sempre no mesmo lugar, caminhe
-            // para o proximo setor e faca uma nova busca ali.
+            // The player asked for a diamond: open a REAL mine, not x-ray scanning.
+            if (getJob() == Alvos.MINERAR && getChoice() == DIAMOND_CHOICE) {
+                if (tickCount % 12 == 0) scanVisibleDiamond();
+                if (targetBlock == null) excavateDiamondTick();
+                return;
+            }
+            // Forests and surface ores continue exploring loaded sectors.
             if (scoutGoal != null) advanceScout();
-            else if (tickCount % 4 == 0) scanForBlocks(300);
+            else if (tickCount % 2 == 0) scanForBlocks(700);
             return;
         }
-        if (standingBlock == null || !level.isLoaded(targetBlock) || !isDesiredBlock(targetBlock)) {
+        BlockPos pos = targetBlock;
+        if (standingBlock == null || !level.isLoaded(pos) || !isDesiredBlock(pos)) {
             clearTarget(); return;
         }
-        if (distanceToSqr(standingBlock.getX() + .5D, standingBlock.getY(), standingBlock.getZ() + .5D) > 3.1D) {
-            if (tickCount % 18 == 0 && !getNavigation().moveTo(standingBlock.getX() + .5D,
-                    standingBlock.getY(), standingBlock.getZ() + .5D, 1.0D)) unreachableTicks += 18;
-            if (++unreachableTicks > 220) {
-                rememberFailedTarget(targetBlock);
+        if (!canReachBlock(pos)) {
+            if (distanceToSqr(standingBlock.getX() + .5D,
+                    standingBlock.getY(), standingBlock.getZ() + .5D) > 1.2D) {
+                if (tickCount % 16 == 0 && !getNavigation().moveTo(standingBlock.getX() + .5D,
+                        standingBlock.getY(), standingBlock.getZ() + .5D, 1.05D)) unreachableTicks += 16;
+                if (++unreachableTicks > 160) {
+                    rememberFailedTarget(pos);
+                    clearTarget();
+                }
+            } else {
+                // Never dig a target through a wall just because it is nearby.
+                rememberFailedTarget(pos);
                 clearTarget();
             }
             return;
         }
-        if (cooldown > 0) return;
+        if (!safeStand(blockPosition())) { rememberFailedTarget(pos); clearTarget(); return; }
+        getNavigation().stop();
         int job = getJob();
         int slot = job == Alvos.MINERAR ? PICK : AXE;
-        ItemStack tool = tools.get(slot);
-        BlockPos pos = targetBlock;
-        if (!level.isLoaded(pos) || !isDesiredBlock(pos)) { clearTarget(); return; }
-        if (!safeStand(standingBlock) || tool.isEmpty()) {
-            rememberFailedTarget(pos); clearTarget(); return;
+        int result = workOnBlock(pos, slot, false);
+        if (result < 0) {
+            rememberFailedTarget(pos);
+            clearTarget();
+        } else if (result > 0) {
+            successes[job] = Math.min(100, successes[job] + 1);
+            clearTarget();
+            completedAutonomousAction();
         }
+    }
+
+    /** Return -1 when unsafe, 0 while mining, +1 when a real block breaks. */
+    private int workOnBlock(BlockPos pos, int slot, boolean tunnel) {
+        if (cooldown > 0) return 0;
+        if (!level.isLoaded(pos) || level.isEmptyBlock(pos)) return -1;
         BlockState state = level.getBlockState(pos);
-        ServerWorld server = (ServerWorld) level;
+        ItemStack tool = tools.get(slot);
+        if (tool.isEmpty() || !canReachBlock(pos)) return -1;
+        if (state.getDestroySpeed(level, pos) < 0) return -1;
+        if (tunnel && !canTunnelBreak(state, pos, tool)) return -1;
         if (breakingBlock == null || !breakingBlock.equals(pos)) {
             stopBreakingAnimation();
             float hardness = state.getDestroySpeed(level, pos);
-            if (hardness < 0) { rememberFailedTarget(pos); clearTarget(); return; }
+            int tier = tool.getItem() instanceof TieredItem
+                    ? ((TieredItem) tool.getItem()).getTier().getLevel() : 0;
             breakingBlock = pos.immutable();
             breakingTicks = 0;
             breakingStage = -1;
-            int tier = tool.getItem() instanceof TieredItem ? ((TieredItem) tool.getItem()).getTier().getLevel() : 0;
-            // Mais duros levam mais tempo. Cada bloco leva ao menos 24 ticks
-            // para as rachaduras serem perceptiveis, sem mineracao instantanea.
             breakingDuration = Math.max(24, Math.min(160,
                     Math.round((22.0F + hardness * 15.0F) / (1.0F + tier * 0.20F))));
             entityData.set(ACTION, ACTION_BREAK);
         }
+        ServerWorld server = (ServerWorld) level;
         getLookControl().setLookAt(pos.getX() + .5D, pos.getY() + .5D, pos.getZ() + .5D);
         if (breakingTicks % 8 == 0) swing(Hand.MAIN_HAND);
         breakingTicks++;
@@ -665,25 +747,168 @@ public class CompanheiroEntity extends CreatureEntity {
             breakingStage = stage;
             server.destroyBlockProgress(getId(), pos, stage);
         }
-        if (breakingTicks < breakingDuration) return;
-
-        // Recursos continuam vindo APENAS do bloco existente no mundo.
+        if (breakingTicks < breakingDuration) return 0;
+        // No duplication: drops are produced by the real loot table and tool.
         List<ItemStack> loot = Block.getDrops(state, server, pos, level.getBlockEntity(pos), this, tool);
         boolean broke = level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
         if (broke) {
-            // Efeito vanilla de fragmentos e som de quebra, alem das rachaduras graduais.
             server.levelEvent(2001, pos, Block.getId(state));
             for (ItemStack drop : loot) {
                 ItemStack remain = store(drop.copy());
                 if (!remain.isEmpty()) Block.popResource(level, pos, remain);
             }
             damageTool(slot);
-            successes[job] = Math.min(100, successes[job] + 1);
             spendEnergy();
-            cooldown = job == Alvos.MINERAR ? 15 : 12;
+            cooldown = tunnel ? 5 : slot == PICK ? 15 : 12;
         }
-        clearTarget();
-        if (broke) completedAutonomousAction();
+        finishCracksIfReady();
+        return broke ? 1 : -1;
+    }
+
+    /** Avoid clearing the visual cracks before the last hit lands. */
+    private void finishCracksIfReady() {
+        if (breakingTicks < breakingDuration) return;
+        stopBreakingAnimation();
+    }
+
+    /** Reach from the helper's eye, never through solid blocks. */
+    private boolean canReachBlock(BlockPos pos) {
+        if (!level.isLoaded(pos)) return false;
+        Vector3d eyes = getEyePosition(1.0F);
+        Vector3d center = new Vector3d(pos.getX() + .5D, pos.getY() + .5D, pos.getZ() + .5D);
+        if (eyes.distanceToSqr(center) > BLOCK_REACH * BLOCK_REACH) return false;
+        RayTraceResult hit = level.clip(new RayTraceContext(eyes, center,
+                RayTraceContext.BlockMode.COLLIDER, RayTraceContext.FluidMode.NONE, this));
+        return hit.getType() == RayTraceResult.Type.BLOCK
+                && ((BlockRayTraceResult) hit).getBlockPos().equals(pos);
+    }
+
+    /** Checks only actually VISIBLE diamonds within reach, not buried ores. */
+    private void scanVisibleDiamond() {
+        BlockPos origin = blockPosition();
+        for (int dy = -4; dy <= 4; dy++) {
+            for (int dx = -4; dx <= 4; dx++) {
+                for (int dz = -4; dz <= 4; dz++) {
+                    BlockPos pos = origin.offset(dx, dy, dz);
+                    if (!level.isLoaded(pos) || isTemporarilyBlocked(pos)) continue;
+                    if (level.getBlockState(pos).getBlock() != Blocks.DIAMOND_ORE) continue;
+                    if (!canReachBlock(pos)) continue;
+                    targetBlock = pos.immutable();
+                    standingBlock = origin.immutable();
+                    unreachableTicks = 0;
+                    getNavigation().stop();
+                    return;
+                }
+            }
+        }
+    }
+
+    /** Dig only natural terrain; do not destroy player structures or block entities. */
+    private boolean canTunnelBreak(BlockState state, BlockPos pos, ItemStack pickaxe) {
+        if (level.getBlockEntity(pos) != null) return false;
+        if (state.requiresCorrectToolForDrops() && !pickaxe.isCorrectToolForDrops(state)) return false;
+        Block block = state.getBlock();
+        if (block == Blocks.STONE || block == Blocks.GRANITE || block == Blocks.DIORITE
+                || block == Blocks.ANDESITE || block == Blocks.DIRT || block == Blocks.GRASS_BLOCK
+                || block == Blocks.COARSE_DIRT || block == Blocks.PODZOL
+                || block == Blocks.SANDSTONE || block == Blocks.RED_SANDSTONE) return true;
+        // The tier check above also protects diamond/gold/ancient debris.
+        for (Block ore : Alvos.MINERIOS) if (block == ore) return true;
+        return false;
+    }
+
+    /** Reject liquid exposure, unstable ceilings and dangerous neighboring blocks. */
+    private boolean safeTunnelPlan(BlockPos foot) {
+        if (foot.getY() < DIAMOND_TUNNEL_Y || foot.getY() > 250) return false;
+        BlockPos head = foot.above();
+        BlockPos floor = foot.below();
+        if (!level.isLoaded(foot) || !level.isLoaded(head) || !level.isLoaded(floor)
+                || !level.isLoaded(head.above())) return false;
+        if (level.isEmptyBlock(floor) || dangerous(level.getBlockState(floor).getBlock())
+                || !level.getFluidState(floor).isEmpty()) return false;
+        Block aboveHead = level.getBlockState(head.above()).getBlock();
+        if (aboveHead == Blocks.SAND || aboveHead == Blocks.RED_SAND
+                || aboveHead == Blocks.GRAVEL) return false;
+        for (BlockPos pos : new BlockPos[]{foot, head}) {
+            if (!level.getFluidState(pos).isEmpty()) return false;
+            BlockState state = level.getBlockState(pos);
+            if (!state.isAir() && !canTunnelBreak(state, pos, tools.get(PICK))) return false;
+            for (Direction dir : Direction.values()) {
+                BlockPos around = pos.relative(dir);
+                if (!level.isLoaded(around) || !level.getFluidState(around).isEmpty()) return false;
+                if (dangerous(level.getBlockState(around).getBlock())) return false;
+            }
+        }
+        return true;
+    }
+
+    private void rotateTunnel() {
+        stopBreakingAnimation();
+        getNavigation().stop();
+        tunnelNextFoot = null;
+        tunnelMoveTicks = 0;
+        tunnelDirection = tunnelDirection == null ? Direction.NORTH : tunnelDirection.getClockWise();
+        if (++tunnelFailedDirections >= 8) {
+            // Cannot open a safe route. Return instead of mining in a lethal spot.
+            finishJob();
+        }
+    }
+
+    /** Walk down one block at a time, clearing a 2-high staircase. */
+    private void excavateDiamondTick() {
+        if (isFull() || tools.get(PICK).isEmpty()) { finishJob(); return; }
+        if (tunnelSteps >= MAX_TUNNEL_STEPS) { finishJob(); return; }
+        if (tunnelDirection == null) {
+            tunnelDirection = getDirection();
+            if (tunnelDirection.getAxis() == Direction.Axis.Y) tunnelDirection = Direction.NORTH;
+        }
+        if (tunnelNextFoot == null) {
+            BlockPos current = blockPosition();
+            if (current.getY() <= DIAMOND_TUNNEL_Y && tunnelSegmentSteps >= tunnelSegmentLength) {
+                // Spiral branches cover new Y=11 areas without looping the same square.
+                tunnelDirection = tunnelDirection.getClockWise();
+                tunnelSegmentSteps = 0;
+                if (++tunnelTurns % 2 == 0) tunnelSegmentLength += 5;
+            }
+            BlockPos next = current.relative(tunnelDirection);
+            if (current.getY() > DIAMOND_TUNNEL_Y) next = next.below();
+            double dx = next.getX() - home.getX(), dz = next.getZ() - home.getZ();
+            if (dx * dx + dz * dz >= (EXPLORE_RADIUS - 4) * (EXPLORE_RADIUS - 4)
+                    || !safeTunnelPlan(next)) {
+                rotateTunnel();
+                return;
+            }
+            tunnelNextFoot = next.immutable();
+            tunnelMoveTicks = 0;
+        }
+        BlockPos foot = tunnelNextFoot;
+        if (!safeTunnelPlan(foot)) { rotateTunnel(); return; }
+        // Head first: prevents trying to reach through a wall while descending.
+        for (BlockPos part : new BlockPos[]{foot.above(), foot}) {
+            if (!level.isEmptyBlock(part)) {
+                int broken = workOnBlock(part, PICK, true);
+                if (broken < 0) rotateTunnel();
+                return;
+            }
+        }
+        if (!safeStand(foot)) { rotateTunnel(); return; }
+        double dist = distanceToSqr(foot.getX() + .5D, foot.getY(), foot.getZ() + .5D);
+        if (dist <= 0.42D) {
+            tunnelSteps++;
+            tunnelFailedDirections = 0;
+            if (foot.getY() <= DIAMOND_TUNNEL_Y) tunnelSegmentSteps++;
+            tunnelNextFoot = null;
+            tunnelMoveTicks = 0;
+            getNavigation().stop();
+            return;
+        }
+        if (++tunnelMoveTicks > 90) { rotateTunnel(); return; }
+        if (tickCount % 10 == 0 || tunnelMoveTicks == 1) {
+            if (!getNavigation().moveTo(foot.getX() + .5D, foot.getY(), foot.getZ() + .5D, 1.15D)) {
+                // Let vanilla navigation retry a couple of times before rotating.
+                tunnelMoveTicks += 14;
+            }
+        }
     }
 
     private void stopBreakingAnimation() {
@@ -759,6 +984,8 @@ public class CompanheiroEntity extends CreatureEntity {
                     bestSpot.getX() + 0.5D, bestSpot.getY(), bestSpot.getZ() + 0.5D, 1.03D)) {
                 scoutGoal = bestSpot.immutable();
                 scoutTicks = 0;
+                lastScoutPosition = here.immutable();
+                scoutStuckChecks = 0;
                 return;
             }
         }
@@ -794,7 +1021,12 @@ public class CompanheiroEntity extends CreatureEntity {
             return;
         }
         scoutTicks++;
-        if (scoutTicks > MAX_SCOUT_TICKS) {
+        if (scoutTicks % 20 == 0) {
+            if (blockPosition().distSqr(lastScoutPosition) <= 1.0D) scoutStuckChecks++;
+            else scoutStuckChecks = 0;
+            lastScoutPosition = blockPosition().immutable();
+        }
+        if (scoutTicks > MAX_SCOUT_TICKS || scoutStuckChecks >= 4) {
             scoutGoal = null;
             scoutTicks = 0;
             scanCenter = blockPosition().immutable();
@@ -872,6 +1104,7 @@ public class CompanheiroEntity extends CreatureEntity {
 
     @Nullable
     private BlockPos findStand(BlockPos target) {
+        if (safeStand(blockPosition()) && canReachBlock(target)) return blockPosition().immutable();
         for (Direction direction : Direction.Plane.HORIZONTAL) {
             BlockPos pos = target.relative(direction);
             if (!level.isLoaded(pos) || !level.isLoaded(pos.above()) || !level.isLoaded(pos.below())) continue;
@@ -913,7 +1146,7 @@ public class CompanheiroEntity extends CreatureEntity {
         if (targetMob == null || !targetMob.isAlive() || targetMob.getType() != wanted) {
             targetMob = null;
             attackedCurrentTarget = false;
-            if (tickCount % 70 != 0) return;
+            if (tickCount % 25 != 0) return;
             AxisAlignedBB area = new AxisAlignedBB(blockPosition()).inflate(RANGE, HEIGHT, RANGE);
             List<LivingEntity> nearby = level.getEntitiesOfClass(LivingEntity.class, area,
                     mob -> mob.isAlive() && !mob.hasCustomName() && mob.getType() == wanted
@@ -939,7 +1172,7 @@ public class CompanheiroEntity extends CreatureEntity {
             attackedCurrentTarget = false;
             return;
         }
-        if (distanceToSqr(targetMob) > 4.5D || !canSee(targetMob)) {
+        if (distanceToSqr(targetMob) > MELEE_REACH * MELEE_REACH || !canSee(targetMob)) {
             if (tickCount % 18 == 0 && !getNavigation().moveTo(targetMob, 1.08D)) unreachableTicks += 18;
             if (++unreachableTicks > 260) {
                 targetMob = null;
@@ -1059,6 +1292,11 @@ public class CompanheiroEntity extends CreatureEntity {
         tag.putIntArray("Preferences", preferences);
         tag.putIntArray("Successes", successes);
         tag.putInt("WorkActions", workActions);
+        tag.putInt("TunnelSteps", tunnelSteps);
+        tag.putInt("TunnelDirection", tunnelDirection == null ? -1 : tunnelDirection.get3DDataValue());
+        tag.putInt("TunnelSegmentSteps", tunnelSegmentSteps);
+        tag.putInt("TunnelSegmentLength", tunnelSegmentLength);
+        tag.putInt("TunnelTurns", tunnelTurns);
         int[] seen = new int[scouted.length];
         for (int i = 0; i < scouted.length; i++) seen[i] = scouted[i] ? 1 : 0;
         tag.putIntArray("ExplorationSeen", seen);
@@ -1101,6 +1339,15 @@ public class CompanheiroEntity extends CreatureEntity {
             }
         }
         workActions = tag.getInt("WorkActions");
+        tunnelSteps = Math.max(0, Math.min(MAX_TUNNEL_STEPS, tag.getInt("TunnelSteps")));
+        int directionOrdinal = tag.contains("TunnelDirection") ? tag.getInt("TunnelDirection") : -1;
+        tunnelDirection = directionOrdinal < 0 || directionOrdinal > 5
+                ? null : Direction.from3DDataValue(directionOrdinal);
+        tunnelNextFoot = null;
+        tunnelMoveTicks = 0;
+        tunnelSegmentSteps = Math.max(0, tag.getInt("TunnelSegmentSteps"));
+        tunnelSegmentLength = Math.max(8, tag.getInt("TunnelSegmentLength"));
+        tunnelTurns = Math.max(0, tag.getInt("TunnelTurns"));
         scanCenter = blockPosition().immutable();
         scanIndex = 0;
         scoutGoal = null;
