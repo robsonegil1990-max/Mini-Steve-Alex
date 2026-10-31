@@ -55,6 +55,9 @@ import javax.annotation.Nullable;
 import java.util.List;
 import java.util.UUID;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
@@ -87,6 +90,9 @@ public class CompanheiroEntity extends CreatureEntity {
     private static final int DIAMOND_CHOICE = 3;
     private static final int DIAMOND_TUNNEL_Y = 11;
     private static final int MAX_TUNNEL_STEPS = 200;
+    private static final int MAX_TREE_LOGS = 320;
+    private static final int TREE_RADIUS = 8;
+    private static final int TREE_HEIGHT = 38;
     private static final int EXPLORE_STEP = 12;
     private static final int EXPLORE_REACH = 28;
     private static final int MAX_SCOUT_TICKS = 220;
@@ -161,10 +167,17 @@ public class CompanheiroEntity extends CreatureEntity {
     @Nullable private Direction tunnelDirection;
     private int tunnelSteps;
     private int tunnelMoveTicks;
+    private boolean tunnelDescending;
     private int tunnelFailedDirections;
     private int tunnelSegmentSteps;
     private int tunnelSegmentLength = 8;
     private int tunnelTurns;
+    // Caminho que o proprio mini abriu: permite voltar pela escada em vez de
+    // tentar atravessar a montanha quando a tarefa terminar.
+    private final List<BlockPos> tunnelTrail = new ArrayList<>();
+    private BlockPos lastReturnProgress = BlockPos.ZERO;
+    private int returnStuckTicks;
+    private int lastTreeWarning = -9999;
     private BlockPos lastScoutPosition = BlockPos.ZERO;
     private int scoutStuckChecks;
     private int autonomousActions;
@@ -172,6 +185,16 @@ public class CompanheiroEntity extends CreatureEntity {
     private boolean switchAfterAttack;
     private int nextAutoAttempt;
     private int lastAutoJob;
+    // Objetivos persistentes: nao muda de trabalho a cada dois blocos.
+    private int autoGoalStarted;
+    private int lastNeedMessage;
+    // Ameaça de autodefesa nao altera ordens do jogador.
+    @Nullable private MonsterEntity defensiveThreat;
+    // Detector geral de travamento, sem teleportar ou atravessar paredes.
+    private BlockPos lastTravelPosition = BlockPos.ZERO;
+    private int travelStuckChecks;
+    // Evita vasculhar monstros do mundo todo a cada tick.
+    private int nextDefenseScan;
     private int authorisedJobs; // apenas categorias que o dono escolheu manualmente
     private final int[] preferredTarget = new int[5];
     private final int[] preferences = new int[5];
@@ -289,11 +312,17 @@ public class CompanheiroEntity extends CreatureEntity {
         tunnelDirection = null;
         tunnelSteps = 0;
         tunnelMoveTicks = 0;
+        tunnelDescending = false;
         tunnelFailedDirections = 0;
         tunnelSegmentSteps = 0;
         tunnelSegmentLength = 8;
         tunnelTurns = 0;
+        if (changeHome) tunnelTrail.clear();
+        returnStuckTicks = 0;
         scoutStuckChecks = 0;
+        lastTravelPosition = blockPosition().immutable();
+        travelStuckChecks = 0;
+        defensiveThreat = null;
         huntMisses = 0;
         targetBlock = null;
         standingBlock = null;
@@ -341,6 +370,8 @@ public class CompanheiroEntity extends CreatureEntity {
         entityData.set(AUTO, true);
         home = blockPosition().immutable();
         Arrays.fill(blockedJobUntil, 0);
+        autoGoalStarted = tickCount;
+        lastNeedMessage = -1000;
         nextAutoAttempt = 0;
         // Garante rotacao perceptivel, em vez de repetir a ordem manual indefinidamente.
         lastAutoJob = getJob();
@@ -350,12 +381,29 @@ public class CompanheiroEntity extends CreatureEntity {
     }
 
     private void chooseNextAutonomousJob() {
+        // Se o mineiro esta subterraneo, regressa pela escada ANTES de trocar
+        // para arvores/animais. Do contrario ele ficaria perdido sob a terra.
+        if (tunnelTrail.size() > 1) {
+            configureJob(Alvos.PARADO, 0, false);
+            entityData.set(RETURNING, true);
+            nextAutoAttempt = tickCount + 40;
+            return;
+        }
         boolean[] availableTools = new boolean[5];
         for (int job = 1; job <= 4; job++) {
             availableTools[job] = hasToolFor(job, preferredTarget[job]);
         }
         int next = Cerebro.escolherTarefa(authorisedJobs, availableTools, blockedJobUntil,
                 tickCount, lastAutoJob, preferences, successes);
+        // Um jogador busca comida antes de continuar trabalhando com fome.
+        // A rotina continua respeitando categorias e ferramentas autorizadas.
+        if (getFoodLevel() <= 12 && !hasFoodInBag()
+                && canAutoChoose(Alvos.CACAR, availableTools)) {
+            next = Alvos.CACAR;
+        } else if (countLogsInBag() < 12 && canAutoChoose(Alvos.MADEIRA, availableTools)
+                && lastAutoJob != Alvos.MADEIRA) {
+            next = Alvos.MADEIRA;
+        }
         if (next == 0) {
             configureJob(Alvos.PARADO, 0, false);
             entityData.set(RETURNING, true);
@@ -363,9 +411,11 @@ public class CompanheiroEntity extends CreatureEntity {
         } else {
             lastAutoJob = next;
             autonomousActions = 0;
-            // Diamond stair-mining can take several real Minecraft minutes.
+            autoGoalStarted = tickCount;
+            // Mantem o objetivo por tempo suficiente para parecer uma expedicao de verdade.
+            // Diamante continua exigindo tempo extra para cavar a descida.
             autoTaskDeadline = tickCount + (next == Alvos.MINERAR && preferredTarget[next] == DIAMOND_CHOICE
-                    ? 9600 : 1000);
+                    ? 9600 : 3200);
             configureJob(next, preferredTarget[next], false);
             PlayerEntity owner = ownerNearby();
             if (owner != null) {
@@ -409,6 +459,8 @@ public class CompanheiroEntity extends CreatureEntity {
             ItemStack held = player.getItemInHand(hand);
             if (player.isShiftKeyDown() && isTool(held)) {
                 equip(player, held);
+            } else if (player.isShiftKeyDown() && held.getItem() == Items.TORCH) {
+                supplyTorches(player, held);
             } else if (player.isShiftKeyDown() && held.getItem().isEdible()) {
                 feedFromStack(player, held);
             } else {
@@ -432,6 +484,17 @@ public class CompanheiroEntity extends CreatureEntity {
         if (!old.isEmpty()) giveOrDrop(player, old.copy());
         refreshHeldItem();
         player.displayClientMessage(new StringTextComponent("Equipado! Abra o menu para ver as ferramentas."), true);
+    }
+
+    /** O dono pode abastecer a mochila com tochas reais (Shift + clique direito). */
+    private void supplyTorches(PlayerEntity player, ItemStack stack) {
+        ItemStack offered = stack.copy();
+        ItemStack leftover = store(offered);
+        int accepted = stack.getCount() - leftover.getCount();
+        if (!player.abilities.instabuild) stack.shrink(accepted);
+        player.displayClientMessage(new StringTextComponent(accepted > 0
+                ? "Mini: recebi " + accepted + " tocha(s) para iluminar a mina."
+                : "Mini: mochila cheia. Recolha os itens antes de me dar tochas."), true);
     }
 
     private void refreshHeldItem() {
@@ -532,7 +595,8 @@ public class CompanheiroEntity extends CreatureEntity {
                 entityData.set(FOOD, getFoodLevel() - 1);
             }
         }
-        if (getFoodLevel() <= 6) eatFromOwnBag();
+        // O mini nao espera ate ficar prestes a morrer de fome para comer.
+        if (getFoodLevel() <= 12) eatFromOwnBag();
         if (!recoveryPause && (isOnFire() || getHealth() <= getMaxHealth() * .32F)) {
             recoveryPause = true;
             stopBreakingAnimation();
@@ -543,19 +607,41 @@ public class CompanheiroEntity extends CreatureEntity {
                 recoveryPause = false;
                 entityData.set(RETURNING, false);
             } else {
-                followOwnerTick();
+                escapeDangerTick();
                 return;
             }
         }
+        // Nao deixa a IA ignorar um zumbi que esteja realmente atacando o ajudante.
+        // Defender-se nao autoriza sair caçando monstros indiscriminadamente.
+        if (selfDefenseTick()) return;
+        if (isAutonomous() && tickCount % 20 == 0) checkTravelStuck();
         if (getJob() == Alvos.PARADO) {
-            if (isAutonomous() && tickCount >= nextAutoAttempt && getFoodLevel() > 0 && !isFull()) {
+            // Sair da mina precede o proximo ciclo automatico de trabalho.
+            if (!tunnelTrail.isEmpty()) {
+                followOwnerTick();
+                return;
+            }
+            if (isAutonomous() && tickCount >= nextAutoAttempt && getFoodLevel() >= 9 && !isFull()) {
                 chooseNextAutonomousJob();
             }
             if (getJob() == Alvos.PARADO && (isFollowing() || isReturning())) followOwnerTick();
             return;
         }
+        // Prioridade humana: comida, saude e ferramentas antes de continuar produzindo.
+        if (isAutonomous() && getFoodLevel() <= 4 && !hasFoodInBag()) {
+            pauseAutoForSupplies("estou com fome; preciso de alimento.");
+            return;
+        }
+        if (isAutonomous() && toolAlmostBroken()) {
+            pauseAutoForSupplies("minha ferramenta esta quase quebrando.");
+            return;
+        }
+        if (isAutonomous() && !hasRequiredTool()) {
+            pauseAutoForSupplies("preciso de uma ferramenta para continuar.");
+            return;
+        }
         int plan = Cerebro.decidir(getHealth(), getMaxHealth(), getFoodLevel(), false,
-                false, isFull(), hasRequiredTool());
+                hasFoodInBag(), isFull(), hasRequiredTool());
         if (plan == Cerebro.GUARDAR_ITENS) { finishJob(); return; }
         if (plan == Cerebro.VOLTAR || plan == Cerebro.TROCAR_FERRAMENTA) {
             stopBreakingAnimation();
@@ -581,9 +667,60 @@ public class CompanheiroEntity extends CreatureEntity {
         else gatherTick();
     }
 
+    private boolean canAutoChoose(int job, boolean[] availableTools) {
+        return job > 0 && job < availableTools.length && availableTools[job]
+                && (authorisedJobs & (1 << (job - 1))) != 0
+                && tickCount >= blockedJobUntil[job];
+    }
+
+    private boolean hasFoodInBag() {
+        for (ItemStack stack : storage) {
+            if (!stack.isEmpty() && stack.getItem().isEdible()
+                    && stack.getItem().getFoodProperties() != null
+                    && stack.getItem().getFoodProperties().getNutrition() >= 2
+                    && stack.getItem() != Items.ROTTEN_FLESH
+                    && stack.getItem() != Items.POISONOUS_POTATO
+                    && stack.getItem() != Items.SPIDER_EYE
+                    && stack.getItem() != Items.PUFFERFISH
+                    && stack.getItem() != Items.CHICKEN) return true;
+        }
+        return false;
+    }
+
+    private int countLogsInBag() {
+        int count = 0;
+        for (ItemStack stack : storage) {
+            if (stack.isEmpty()) continue;
+            for (Block log : Alvos.MADEIRAS) {
+                if (stack.getItem() == log.asItem()) { count += stack.getCount(); break; }
+            }
+        }
+        return count;
+    }
+
+    private boolean toolAlmostBroken() {
+        int job = getJob();
+        if (job == Alvos.PARADO) return false;
+        ItemStack tool = tools.get(job == Alvos.MINERAR ? PICK : job == Alvos.MADEIRA ? AXE : SWORD);
+        return !tool.isEmpty() && tool.isDamageableItem()
+                && tool.getMaxDamage() - tool.getDamageValue() <= 3;
+    }
+
+    private void pauseAutoForSupplies(String reason) {
+        stopBreakingAnimation();
+        configureJob(Alvos.PARADO, 0, false);
+        entityData.set(RETURNING, true);
+        nextAutoAttempt = tickCount + 200;
+        if (tickCount - lastNeedMessage >= 200) {
+            lastNeedMessage = tickCount;
+            PlayerEntity owner = ownerNearby();
+            if (owner != null) owner.displayClientMessage(new StringTextComponent("Mini: " + reason), true);
+        }
+    }
+
     /** Usa apenas alimento fisicamente presente na mochila e nao come itens perigosos. */
     private boolean eatFromOwnBag() {
-        if (getFoodLevel() > 6) return false;
+        if (getFoodLevel() > 12) return false;
         for (int i = 0; i < STORAGE_SIZE; i++) {
             ItemStack stack = storage.get(i);
             if (stack.isEmpty() || !stack.getItem().isEdible() || stack.getItem().getFoodProperties() == null) continue;
@@ -609,7 +746,119 @@ public class CompanheiroEntity extends CreatureEntity {
         return null;
     }
 
+    /** Retira-se do perigo real em vez de apenas ficar olhando para o dono. */
+    private void escapeDangerTick() {
+        MonsterEntity enemy = nearestThreat(9.0D, false);
+        if (enemy != null && tickCount % 16 == 0) {
+            double awayX = getX() - enemy.getX();
+            double awayZ = getZ() - enemy.getZ();
+            double len = Math.sqrt(awayX * awayX + awayZ * awayZ);
+            if (len > .001D) {
+                int x = (int) Math.round(getX() + awayX * 6 / len);
+                int z = (int) Math.round(getZ() + awayZ * 6 / len);
+                BlockPos destination = findScoutStand(x, z);
+                if (destination != null && safeStand(destination)) {
+                    getNavigation().moveTo(destination.getX() + .5D,
+                            destination.getY(), destination.getZ() + .5D, 1.18D);
+                    return;
+                }
+            }
+        }
+        followOwnerTick();
+    }
+
+    @Nullable
+    private MonsterEntity nearestThreat(double radius, boolean onlyAttacking) {
+        AxisAlignedBB area = getBoundingBox().inflate(radius, 3.0D, radius);
+        MonsterEntity best = null;
+        double bestDist = radius * radius;
+        for (MonsterEntity hostile : level.getEntitiesOfClass(MonsterEntity.class, area,
+                mob -> mob.isAlive() && !mob.isNoAi())) {
+            double d = distanceToSqr(hostile);
+            if (d >= bestDist || !canSee(hostile)) continue;
+            boolean dangerousToMini = hostile.getTarget() == this || d <= 7.0D;
+            if (onlyAttacking && !dangerousToMini) continue;
+            best = hostile;
+            bestDist = d;
+        }
+        return best;
+    }
+
+    /** Defende-se de monstros proximos, sem mudar o alvo escolhido pelo dono. */
+    private boolean selfDefenseTick() {
+        if (getFoodLevel() <= 0 || tools.get(SWORD).isEmpty()) {
+            // Sem espada um jogador prudente foge, nao enfrenta zumbis de mao vazia.
+            if (tickCount % 12 == 0 && nearestThreat(4.5D, true) != null) {
+                escapeDangerTick();
+                return true;
+            }
+            return false;
+        }
+        if (defensiveThreat != null && (!defensiveThreat.isAlive()
+                || !level.isLoaded(defensiveThreat.blockPosition())
+                || distanceToSqr(defensiveThreat) > 80.0D
+                || (defensiveThreat.getTarget() != this && distanceToSqr(defensiveThreat) > 12.0D))) {
+            defensiveThreat = null;
+        }
+        if (tickCount >= nextDefenseScan) {
+            nextDefenseScan = tickCount + 12;
+            MonsterEntity found = nearestThreat(5.0D, true);
+            if (found != null) defensiveThreat = found;
+        }
+        if (defensiveThreat == null) return false;
+        stopBreakingAnimation();
+        MonsterEntity enemy = defensiveThreat;
+        getLookControl().setLookAt(enemy, 25.0F, 25.0F);
+        if (distanceToSqr(enemy) > MELEE_REACH * MELEE_REACH || !canSee(enemy)) {
+            if (tickCount % 14 == 0) getNavigation().moveTo(enemy, 1.10D);
+            return true;
+        }
+        getNavigation().stop();
+        if (cooldown > 0) return true;
+        ItemStack sword = tools.get(SWORD);
+        if (!(sword.getItem() instanceof TieredItem)) return false;
+        int tier = ((TieredItem) sword.getItem()).getTier().getLevel();
+        entityData.set(ACTION, ACTION_ATTACK);
+        combatPoseTicks = 10;
+        swing(Hand.MAIN_HAND);
+        if (enemy.hurt(DamageSource.mobAttack(this), 2.0F + Math.min(tier, 4) * .85F)) {
+            damageTool(SWORD);
+            spendEnergy();
+        }
+        cooldown = 25;
+        if (!enemy.isAlive()) defensiveThreat = null;
+        return true;
+    }
+
+    /** Recupera o caminho se uma rota normal ficar fisicamente bloqueada. */
+    private void checkTravelStuck() {
+        if (getNavigation().isDone()) {
+            lastTravelPosition = blockPosition().immutable();
+            travelStuckChecks = 0;
+            return;
+        }
+        if (blockPosition().distSqr(lastTravelPosition) < 2.0D) travelStuckChecks++;
+        else travelStuckChecks = 0;
+        lastTravelPosition = blockPosition().immutable();
+        if (travelStuckChecks < 4) return;
+        travelStuckChecks = 0;
+        getNavigation().stop();
+        if (targetBlock != null) {
+            rememberFailedTarget(targetBlock);
+            clearTarget();
+        } else if (scoutGoal != null) {
+            scoutGoal = null;
+            scanIndex = 0;
+        } else if (tunnelNextFoot != null) {
+            rotateTunnel();
+        }
+        if (safeStand(blockPosition())) getJumpControl().jump();
+    }
+
     private void followOwnerTick() {
+        // A subida pode ocorrer mesmo se o dono estiver longe; apenas chunks
+        // ja carregados sao utilizados, sem force-load de terreno.
+        if (!tunnelTrail.isEmpty() && followExcavatedRoute()) return;
         PlayerEntity owner = ownerNearby();
         if (owner == null) return;
         double d = distanceToSqr(owner);
@@ -621,6 +870,52 @@ public class CompanheiroEntity extends CreatureEntity {
         if (tickCount % 18 == 0) getNavigation().moveTo(owner, 1.12D);
     }
 
+    /** Regressa pelos degraus REAIS, sem teletransporte e sem blocos fantasmas. */
+    private boolean followExcavatedRoute() {
+        while (tunnelTrail.size() > 1) {
+            BlockPos previous = tunnelTrail.get(tunnelTrail.size() - 2);
+            double dist = distanceToSqr(previous.getX() + .5D, previous.getY(), previous.getZ() + .5D);
+            if (dist < 1.15D) {
+                tunnelTrail.remove(tunnelTrail.size() - 1);
+                returnStuckTicks = 0;
+                continue;
+            }
+            if (!safeStand(previous)) {
+                // Alguem pode ter tapado a escada. Avisa e tenta rota alternativa
+                // vanilla, em vez de ficar eternamente batendo na parede.
+                returnStuckTicks++;
+                if (returnStuckTicks == 120) {
+                    PlayerEntity owner = ownerNearby();
+                    if (owner != null) owner.displayClientMessage(new StringTextComponent(
+                            "Mini: meu caminho de volta foi bloqueado. Abra a escada para me ajudar!"), true);
+                }
+                if (returnStuckTicks > 120 && tickCount % 40 == 0) {
+                    PlayerEntity owner = ownerNearby();
+                    if (owner != null) getNavigation().moveTo(owner, 1.05D);
+                }
+                return true;
+            }
+            if (tickCount % 12 == 0) getNavigation().moveTo(
+                    previous.getX() + .5D, previous.getY(), previous.getZ() + .5D, 1.10D);
+            if (tickCount % 20 == 0) {
+                if (blockPosition().distSqr(lastReturnProgress) < 1.0D) returnStuckTicks += 20;
+                else returnStuckTicks = 0;
+                lastReturnProgress = blockPosition().immutable();
+            }
+            // Escadas estreitas sao um caso em que a navegacao vanilla falha
+            // ocasionalmente mesmo com os dois blocos livres.
+            if (returnStuckTicks > 30 && dist < 6.0D) {
+                getMoveControl().setWantedPosition(previous.getX() + .5D,
+                        previous.getY(), previous.getZ() + .5D, 1.10D);
+                if (previous.getY() > blockPosition().getY()) getJumpControl().jump();
+            }
+            return true;
+        }
+        tunnelTrail.clear();
+        returnStuckTicks = 0;
+        return false;
+    }
+
     private boolean hasRequiredTool() {
         return hasToolFor(getJob(), getChoice());
     }
@@ -629,6 +924,8 @@ public class CompanheiroEntity extends CreatureEntity {
         if (!Alvos.valid(job, choice)) return false;
         ItemStack tool = tools.get(job == Alvos.MINERAR ? PICK : job == Alvos.MADEIRA ? AXE : SWORD);
         if (tool.isEmpty()) return false;
+        // Equipamento no fim da durabilidade nao deve iniciar expedicoes longas.
+        if (tool.isDamageableItem() && tool.getMaxDamage() - tool.getDamageValue() <= 3) return false;
         if (job == Alvos.MINERAR) {
             return tool.getItem() instanceof PickaxeItem && Regras.picaretaSuficiente(
                     ((TieredItem) tool.getItem()).getTier().getLevel(), Alvos.NIVEL_PICARETA[choice]);
@@ -649,7 +946,8 @@ public class CompanheiroEntity extends CreatureEntity {
     private void gatherTick() {
         if (targetBlock == null) {
             // The player asked for a diamond: open a REAL mine, not x-ray scanning.
-            if (getJob() == Alvos.MINERAR && getChoice() == DIAMOND_CHOICE) {
+            if (getJob() == Alvos.MINERAR && getChoice() == DIAMOND_CHOICE
+                    && (!isAutonomous() || preferredTarget[Alvos.MINERAR] == DIAMOND_CHOICE)) {
                 if (tickCount % 12 == 0) scanVisibleDiamond();
                 if (targetBlock == null) excavateDiamondTick();
                 return;
@@ -725,21 +1023,114 @@ public class CompanheiroEntity extends CreatureEntity {
             server.destroyBlockProgress(getId(), pos, stage);
         }
         if (breakingTicks < breakingDuration) return 0;
-        // No duplication: drops are produced by the real loot table and tool.
-        List<ItemStack> loot = Block.getDrops(state, server, pos, level.getBlockEntity(pos), this, tool);
-        boolean broke = level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
-        if (broke) {
-            server.levelEvent(2001, pos, Block.getId(state));
-            for (ItemStack drop : loot) {
-                ItemStack remain = store(drop.copy());
-                if (!remain.isEmpty()) Block.popResource(level, pos, remain);
+        if (slot == AXE && getJob() == Alvos.MADEIRA && !tunnel) {
+            // Tree-felling: chacha a base, depois derruba os outros troncos
+            // conectados. Nao deixa copa suspensa nem cria madeira artificial.
+            List<BlockPos> tree = collectNaturalTree(pos);
+            if (tree == null || !canFinishTree(tool, tree.size())) {
+                if (tickCount - lastTreeWarning > 200) {
+                    lastTreeWarning = tickCount;
+                    PlayerEntity owner = ownerNearby();
+                    if (owner != null) owner.displayClientMessage(new StringTextComponent(
+                            "Mini: arvore muito grande, sem machado suficiente ou sem base natural."), true);
+                }
+                stopBreakingAnimation();
+                return -1;
             }
-            damageTool(slot);
-            spendEnergy();
-            cooldown = tunnel ? 5 : slot == PICK ? 15 : 12;
+            int chopped = 0;
+            for (BlockPos log : tree) {
+                if (tools.get(AXE).isEmpty() || !breakRealBlock(log, AXE)) break;
+                chopped++;
+            }
+            cooldown = 20;
+            finishCracksIfReady();
+            return chopped == tree.size() ? 1 : -1;
         }
+        // Mineros e tuneis seguem a mesma regra de drops reais e desgaste.
+        boolean broke = breakRealBlock(pos, slot);
+        if (broke) cooldown = tunnel ? 5 : slot == PICK ? 15 : 12;
         finishCracksIfReady();
         return broke ? 1 : -1;
+    }
+
+    /** Rompe o bloco do mundo, respeitando a loot table e 1 desgaste real. */
+    private boolean breakRealBlock(BlockPos pos, int slot) {
+        if (!level.isLoaded(pos) || level.isEmptyBlock(pos)) return false;
+        ItemStack tool = tools.get(slot);
+        if (tool.isEmpty()) return false;
+        BlockState state = level.getBlockState(pos);
+        if (state.getDestroySpeed(level, pos) < 0 || level.getBlockEntity(pos) != null) return false;
+        ServerWorld server = (ServerWorld) level;
+        List<ItemStack> loot = Block.getDrops(state, server, pos, null, this, tool);
+        if (!level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3)) return false;
+        server.levelEvent(2001, pos, Block.getId(state));
+        for (ItemStack drop : loot) {
+            ItemStack remaining = store(drop.copy());
+            if (!remaining.isEmpty()) Block.popResource(level, pos, remaining);
+        }
+        damageTool(slot);
+        spendEnergy();
+        return true;
+    }
+
+    /** Nao aceita casas feitas de madeira: exige troncos da especie, folhas e solo natural. */
+    @Nullable
+    private List<BlockPos> collectNaturalTree(BlockPos start) {
+        if (!level.isLoaded(start)) return null;
+        Block species = level.getBlockState(start).getBlock();
+        if (species != Alvos.MADEIRAS[getChoice()]) return null;
+        ArrayDeque<BlockPos> queue = new ArrayDeque<>();
+        Set<Long> visited = new HashSet<>();
+        List<BlockPos> logs = new ArrayList<>();
+        queue.add(start);
+        boolean naturalRoot = false;
+        boolean hasCanopy = false;
+        while (!queue.isEmpty()) {
+            BlockPos at = queue.removeFirst();
+            if (!visited.add(at.asLong())) continue;
+            // Se um tronco contiguo sai do limite, aborta a arvore inteira:
+            // nunca corta so metade por ultrapassar o limite da busca.
+            if (Math.abs(at.getX() - start.getX()) > TREE_RADIUS
+                    || Math.abs(at.getZ() - start.getZ()) > TREE_RADIUS
+                    || Math.abs(at.getY() - start.getY()) > TREE_HEIGHT) {
+                if (level.isLoaded(at) && level.getBlockState(at).getBlock() == species) return null;
+                continue;
+            }
+            // Perto de chunk descarregado, recusa a derrubada para nao deixar
+            // a outra metade da arvore pendurada quando voltar a carregar.
+            if (!level.isLoaded(at)) return null;
+            if (level.getBlockState(at).getBlock() != species) continue;
+            if (level.getBlockEntity(at) != null) return null;
+            logs.add(at.immutable());
+            if (logs.size() > MAX_TREE_LOGS) return null;
+            BlockPos under = at.below();
+            if (level.isLoaded(under) && isNaturalTreeSoil(level.getBlockState(under).getBlock())) naturalRoot = true;
+            if (!hasCanopy && folhagemNoNivel(at)) hasCanopy = true;
+            // Diagonais permitem cortar galhos tortos de acacia e arvores grandes.
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        if (dx != 0 || dy != 0 || dz != 0) queue.add(at.offset(dx, dy, dz));
+                    }
+                }
+            }
+        }
+        if (!naturalRoot || !hasCanopy || logs.isEmpty()) return null;
+        // Corte de cima para baixo; nao gera pilhas flutuantes no meio da queda.
+        logs.sort((a, b) -> Integer.compare(b.getY(), a.getY()));
+        return logs;
+    }
+
+    private boolean isNaturalTreeSoil(Block block) {
+        return block == Blocks.GRASS_BLOCK || block == Blocks.DIRT || block == Blocks.PODZOL
+                || block == Blocks.COARSE_DIRT || block == Blocks.MYCELIUM
+                || block == Blocks.CRIMSON_NYLIUM || block == Blocks.WARPED_NYLIUM;
+    }
+
+    /** Evita quebrar so metade da arvore quando o machado acabaria no meio. */
+    private boolean canFinishTree(ItemStack axe, int logCount) {
+        return !axe.isEmpty() && (!axe.isDamageableItem()
+                || axe.getMaxDamage() - axe.getDamageValue() >= logCount);
     }
 
     /** Avoid clearing the visual cracks before the last hit lands. */
@@ -794,26 +1185,39 @@ public class CompanheiroEntity extends CreatureEntity {
         return false;
     }
 
-    /** Reject liquid exposure, unstable ceilings and dangerous neighboring blocks. */
+    /** A descida exige tres blocos livres: altura do degrau DE CIMA + a do degrau de baixo. */
+    private BlockPos[] tunnelClearance(BlockPos foot) {
+        if (foot.getY() < blockPosition().getY()
+                || (tunnelDescending && foot.equals(tunnelNextFoot))) {
+            return new BlockPos[]{foot.above(2), foot.above(), foot};
+        }
+        return new BlockPos[]{foot.above(), foot};
+    }
+
+    /** Nao abrir escadas em lava, blocos de player, teto de areia ou sem chao solido. */
     private boolean safeTunnelPlan(BlockPos foot) {
         if (foot.getY() < DIAMOND_TUNNEL_Y || foot.getY() > 250) return false;
-        BlockPos head = foot.above();
         BlockPos floor = foot.below();
-        if (!level.isLoaded(foot) || !level.isLoaded(head) || !level.isLoaded(floor)
-                || !level.isLoaded(head.above())) return false;
-        if (level.isEmptyBlock(floor) || dangerous(level.getBlockState(floor).getBlock())
-                || !level.getFluidState(floor).isEmpty()) return false;
-        Block aboveHead = level.getBlockState(head.above()).getBlock();
-        if (aboveHead == Blocks.SAND || aboveHead == Blocks.RED_SAND
-                || aboveHead == Blocks.GRAVEL) return false;
-        for (BlockPos pos : new BlockPos[]{foot, head}) {
-            if (!level.getFluidState(pos).isEmpty()) return false;
-            BlockState state = level.getBlockState(pos);
-            if (!state.isAir() && !canTunnelBreak(state, pos, tools.get(PICK))) return false;
+        BlockPos head = foot.above();
+        if (!level.isLoaded(floor) || !level.isLoaded(head)) return false;
+        BlockState floorState = level.getBlockState(floor);
+        if (level.isEmptyBlock(floor) || dangerous(floorState.getBlock())
+                || !floorState.getFluidState().isEmpty()
+                || !floorState.isFaceSturdy(level, floor, Direction.UP)) return false;
+        BlockPos[] corridor = tunnelClearance(foot);
+        BlockPos highest = corridor[0];
+        if (!level.isLoaded(highest.above())) return false;
+        Block overhead = level.getBlockState(highest.above()).getBlock();
+        if (overhead == Blocks.SAND || overhead == Blocks.RED_SAND || overhead == Blocks.GRAVEL) return false;
+        for (BlockPos part : corridor) {
+            if (!level.isLoaded(part)) return false;
+            BlockState state = level.getBlockState(part);
+            if (dangerous(state.getBlock()) || !state.getFluidState().isEmpty()) return false;
+            if (!passable(part) && !canTunnelBreak(state, part, tools.get(PICK))) return false;
             for (Direction dir : Direction.values()) {
-                BlockPos around = pos.relative(dir);
-                if (!level.isLoaded(around) || !level.getFluidState(around).isEmpty()) return false;
-                if (dangerous(level.getBlockState(around).getBlock())) return false;
+                BlockPos neighbor = part.relative(dir);
+                if (!level.isLoaded(neighbor) || !level.getFluidState(neighbor).isEmpty()
+                        || dangerous(level.getBlockState(neighbor).getBlock())) return false;
             }
         }
         return true;
@@ -824,6 +1228,7 @@ public class CompanheiroEntity extends CreatureEntity {
         getNavigation().stop();
         tunnelNextFoot = null;
         tunnelMoveTicks = 0;
+        tunnelDescending = false;
         tunnelDirection = tunnelDirection == null ? Direction.NORTH : tunnelDirection.getClockWise();
         if (++tunnelFailedDirections >= 8) {
             // Cannot open a safe route. Return instead of mining in a lethal spot.
@@ -835,6 +1240,7 @@ public class CompanheiroEntity extends CreatureEntity {
     private void excavateDiamondTick() {
         if (isFull() || tools.get(PICK).isEmpty()) { finishJob(); return; }
         if (tunnelSteps >= MAX_TUNNEL_STEPS) { finishJob(); return; }
+        if (tunnelTrail.isEmpty()) tunnelTrail.add(blockPosition().immutable());
         if (tunnelDirection == null) {
             tunnelDirection = getDirection();
             if (tunnelDirection.getAxis() == Direction.Axis.Y) tunnelDirection = Direction.NORTH;
@@ -856,13 +1262,15 @@ public class CompanheiroEntity extends CreatureEntity {
                 return;
             }
             tunnelNextFoot = next.immutable();
+            tunnelDescending = next.getY() < current.getY();
             tunnelMoveTicks = 0;
         }
         BlockPos foot = tunnelNextFoot;
         if (!safeTunnelPlan(foot)) { rotateTunnel(); return; }
-        // Head first: prevents trying to reach through a wall while descending.
-        for (BlockPos part : new BlockPos[]{foot.above(), foot}) {
-            if (!level.isEmptyBlock(part)) {
+        // Em escada, remover TAMBEM o bloco acima da cabeca da posicao superior.
+        // Planta sem colisao nao precisa ser minerada, e nao bloqueia a passagem.
+        for (BlockPos part : tunnelClearance(foot)) {
+            if (!passable(part)) {
                 int broken = workOnBlock(part, PICK, true);
                 if (broken < 0) rotateTunnel();
                 return;
@@ -870,21 +1278,49 @@ public class CompanheiroEntity extends CreatureEntity {
         }
         if (!safeStand(foot)) { rotateTunnel(); return; }
         double dist = distanceToSqr(foot.getX() + .5D, foot.getY(), foot.getZ() + .5D);
-        if (dist <= 0.42D) {
+        if (dist <= 0.65D) {
             tunnelSteps++;
             tunnelFailedDirections = 0;
+            if (tunnelTrail.isEmpty() || !tunnelTrail.get(tunnelTrail.size() - 1).equals(foot)) {
+                tunnelTrail.add(foot.immutable());
+            }
             if (foot.getY() <= DIAMOND_TUNNEL_Y) tunnelSegmentSteps++;
+            // Ilumina o proprio tunel, se o jogador entregou tochas reais.
+            // O toque e no degrau anterior para nao interferir na navegacao.
+            if (tunnelSteps % 10 == 0) lightTunnelFromBag();
             tunnelNextFoot = null;
             tunnelMoveTicks = 0;
+            tunnelDescending = false;
             getNavigation().stop();
             return;
         }
         if (++tunnelMoveTicks > 90) { rotateTunnel(); return; }
         if (tickCount % 10 == 0 || tunnelMoveTicks == 1) {
-            if (!getNavigation().moveTo(foot.getX() + .5D, foot.getY(), foot.getZ() + .5D, 1.15D)) {
-                // Let vanilla navigation retry a couple of times before rotating.
-                tunnelMoveTicks += 14;
+            getNavigation().moveTo(foot.getX() + .5D, foot.getY(), foot.getZ() + .5D, 1.12D);
+        }
+        // Passagem aberta, mas pathfinder nao compreende um degrau descendente:
+        // comando de movimento curto, sujeito as colisoes normais do Minecraft.
+        if (tunnelMoveTicks > 18 && dist < 7.0D && safeStand(foot)) {
+            getMoveControl().setWantedPosition(foot.getX() + .5D,
+                    foot.getY(), foot.getZ() + .5D, 1.08D);
+        }
+    }
+
+    /** Ilumina passagem sem criar itens: tira uma tocha real da mochila. */
+    private void lightTunnelFromBag() {
+        if (tunnelTrail.size() < 2) return;
+        BlockPos place = tunnelTrail.get(tunnelTrail.size() - 2);
+        if (!level.isLoaded(place) || !level.isEmptyBlock(place)) return;
+        BlockState torch = Blocks.TORCH.defaultBlockState();
+        if (!torch.canSurvive(level, place)) return;
+        for (int i = 0; i < STORAGE_SIZE; i++) {
+            ItemStack stack = storage.get(i);
+            if (stack.isEmpty() || stack.getItem() != Items.TORCH) continue;
+            if (level.setBlock(place, torch, 3)) {
+                stack.shrink(1);
+                if (stack.isEmpty()) storage.set(i, ItemStack.EMPTY);
             }
+            return;
         }
     }
 
@@ -902,7 +1338,13 @@ public class CompanheiroEntity extends CreatureEntity {
     /** Apos dois trabalhos concluidos, troca de categoria se a IA estiver ligada. */
     private void completedAutonomousAction() {
         if (!isAutonomous() || getJob() == Alvos.PARADO) return;
-        if (++autonomousActions >= 2) chooseNextAutonomousJob();
+        // Um objetivo humano exige continuidade: nao abandonar uma arvore/mina
+        // para mudar de profissao apos apenas dois blocos quebrados.
+        int quota = getJob() == Alvos.MADEIRA ? 3
+                : getJob() == Alvos.CACAR ? 3 : getJob() == Alvos.MINERAR ? 12 : 4;
+        if (++autonomousActions >= quota && tickCount - autoGoalStarted >= 500) {
+            chooseNextAutonomousJob();
+        }
     }
 
     private void scanForBlocks(int budget) {
@@ -912,6 +1354,12 @@ public class CompanheiroEntity extends CreatureEntity {
             if (!level.isLoaded(pos) || isTemporarilyBlocked(pos) || !isDesiredBlock(pos)) continue;
             BlockPos stand = findStand(pos);
             if (stand == null) continue;
+            // No modo autonomo, identifica a especie ou minerio local em vez
+            // de ignorar carvalho porque a configuracao antiga dizia betula.
+            if (isAutonomous()) {
+                int discovered = resourceIndex(level.getBlockState(pos).getBlock(), getJob());
+                if (discovered >= 0 && discovered != getChoice()) entityData.set(CHOICE, discovered);
+            }
             targetBlock = pos;
             standingBlock = stand;
             unreachableTicks = 0;
@@ -1041,10 +1489,27 @@ public class CompanheiroEntity extends CreatureEntity {
         return true;
     }
 
+    private int resourceIndex(Block block, int job) {
+        if (job == Alvos.MINERAR) {
+            for (int i = 0; i < Alvos.MINERIOS.length; i++) {
+                if (Alvos.MINERIOS[i] == block && hasToolFor(Alvos.MINERAR, i)) return i;
+            }
+        } else if (job == Alvos.MADEIRA) {
+            for (int i = 0; i < Alvos.MADEIRAS.length; i++) {
+                if (Alvos.MADEIRAS[i] == block) return i;
+            }
+        }
+        return -1;
+    }
+
     private boolean isDesiredBlock(BlockPos pos) {
         Block block = level.getBlockState(pos).getBlock();
-        if (getJob() == Alvos.MINERAR) return block == Alvos.MINERIOS[getChoice()];
-        if (getJob() == Alvos.MADEIRA) return block == Alvos.MADEIRAS[getChoice()] && hasLeavesNearby(pos);
+        if (getJob() == Alvos.MINERAR) return isAutonomous()
+                ? resourceIndex(block, Alvos.MINERAR) >= 0
+                : block == Alvos.MINERIOS[getChoice()];
+        if (getJob() == Alvos.MADEIRA) return (isAutonomous()
+                ? resourceIndex(block, Alvos.MADEIRA) >= 0
+                : block == Alvos.MADEIRAS[getChoice()]) && hasLeavesNearby(pos);
         return false;
     }
 
@@ -1090,13 +1555,27 @@ public class CompanheiroEntity extends CreatureEntity {
         return null;
     }
 
+    /** Ar, capim e flores sao livres; pedra, liquidos e espinhos nao. */
+    private boolean passable(BlockPos pos) {
+        if (!level.isLoaded(pos)) return false;
+        BlockState state = level.getBlockState(pos);
+        return !dangerous(state.getBlock()) && state.getFluidState().isEmpty()
+                && state.getCollisionShape(level, pos).isEmpty();
+    }
+
     private boolean safeStand(BlockPos pos) {
-        boolean clear = level.isEmptyBlock(pos) && level.isEmptyBlock(pos.above());
-        boolean floor = !level.isEmptyBlock(pos.below()) && !dangerous(level.getBlockState(pos.below()).getBlock());
+        if (!level.isLoaded(pos) || !level.isLoaded(pos.above()) || !level.isLoaded(pos.below())) return false;
+        boolean clear = passable(pos) && passable(pos.above());
+        BlockPos floorPos = pos.below();
+        BlockState floorState = level.getBlockState(floorPos);
+        boolean floor = !level.isEmptyBlock(floorPos) && !dangerous(floorState.getBlock())
+                && floorState.getFluidState().isEmpty()
+                && floorState.isFaceSturdy(level, floorPos, Direction.UP);
         boolean hazard = false;
         for (Direction dir : Direction.Plane.HORIZONTAL) {
             BlockPos around = pos.relative(dir);
-            if (level.isLoaded(around) && dangerous(level.getBlockState(around).getBlock())) {
+            if (!level.isLoaded(around) || dangerous(level.getBlockState(around).getBlock())
+                    || !level.getFluidState(around).isEmpty()) {
                 hazard = true;
                 break;
             }
@@ -1107,7 +1586,9 @@ public class CompanheiroEntity extends CreatureEntity {
     private boolean dangerous(Block block) {
         return block == Blocks.LAVA || block == Blocks.WATER || block == Blocks.FIRE || block == Blocks.SOUL_FIRE
                 || block == Blocks.CACTUS || block == Blocks.MAGMA_BLOCK
-                || block == Blocks.CAMPFIRE || block == Blocks.SOUL_CAMPFIRE;
+                || block == Blocks.CAMPFIRE || block == Blocks.SOUL_CAMPFIRE
+                || block == Blocks.COBWEB || block == Blocks.SWEET_BERRY_BUSH
+                || block == Blocks.WITHER_ROSE;
     }
 
     private void huntTick() {
@@ -1216,7 +1697,9 @@ public class CompanheiroEntity extends CreatureEntity {
     }
 
     private boolean isFull() {
-        for (ItemStack item : storage) if (item.isEmpty() || item.getCount() < item.getMaxStackSize()) return false;
+        // Com nove pilhas diferentes ja nao cabe um DECIMO tipo de loot.
+        // Volta ao dono antes de deixar itens valiosos pelo chao.
+        for (ItemStack item : storage) if (item.isEmpty()) return false;
         return true;
     }
 
@@ -1265,6 +1748,7 @@ public class CompanheiroEntity extends CreatureEntity {
         tag.putBoolean("Recovery", recoveryPause);
         tag.putInt("AuthorisedJobs", authorisedJobs);
         tag.putInt("LastAutoJob", lastAutoJob);
+        tag.putInt("AutoGoalAge", Math.max(0, tickCount - autoGoalStarted));
         tag.putIntArray("PreferredTarget", preferredTarget);
         tag.putIntArray("Preferences", preferences);
         tag.putIntArray("Successes", successes);
@@ -1274,6 +1758,9 @@ public class CompanheiroEntity extends CreatureEntity {
         tag.putInt("TunnelSegmentSteps", tunnelSegmentSteps);
         tag.putInt("TunnelSegmentLength", tunnelSegmentLength);
         tag.putInt("TunnelTurns", tunnelTurns);
+        long[] trailPositions = new long[tunnelTrail.size()];
+        for (int i = 0; i < tunnelTrail.size(); i++) trailPositions[i] = tunnelTrail.get(i).asLong();
+        tag.putLongArray("TunnelTrail", trailPositions);
         int[] seen = new int[scouted.length];
         for (int i = 0; i < scouted.length; i++) seen[i] = scouted[i] ? 1 : 0;
         tag.putIntArray("ExplorationSeen", seen);
@@ -1306,6 +1793,11 @@ public class CompanheiroEntity extends CreatureEntity {
         recoveryPause = tag.getBoolean("Recovery");
         authorisedJobs = tag.getInt("AuthorisedJobs") & 15;
         lastAutoJob = tag.getInt("LastAutoJob");
+        autoGoalStarted = tickCount - Math.min(9600, Math.max(0, tag.getInt("AutoGoalAge")));
+        lastNeedMessage = -1000;
+        defensiveThreat = null;
+        lastTravelPosition = blockPosition().immutable();
+        travelStuckChecks = 0;
         restoreArray(tag.getIntArray("PreferredTarget"), preferredTarget);
         restoreArray(tag.getIntArray("Preferences"), preferences);
         restoreArray(tag.getIntArray("Successes"), successes);
@@ -1322,9 +1814,16 @@ public class CompanheiroEntity extends CreatureEntity {
                 ? null : Direction.from3DDataValue(directionOrdinal);
         tunnelNextFoot = null;
         tunnelMoveTicks = 0;
+        tunnelDescending = false;
         tunnelSegmentSteps = Math.max(0, tag.getInt("TunnelSegmentSteps"));
         tunnelSegmentLength = Math.max(8, tag.getInt("TunnelSegmentLength"));
         tunnelTurns = Math.max(0, tag.getInt("TunnelTurns"));
+        tunnelTrail.clear();
+        long[] restoredTrail = tag.getLongArray("TunnelTrail");
+        for (int i = 0; i < restoredTrail.length && i <= MAX_TUNNEL_STEPS; i++) {
+            tunnelTrail.add(BlockPos.of(restoredTrail[i]));
+        }
+        returnStuckTicks = 0;
         scanCenter = blockPosition().immutable();
         scanIndex = 0;
         scoutGoal = null;
